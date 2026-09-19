@@ -1,7 +1,9 @@
 import streamlit as st
 import requests
 import re
-from groq import Groq
+import groq
+
+client = groq.Client(api_key=GROQ_API_KEY)
 
 # =========================
 # 🔑 KEYS
