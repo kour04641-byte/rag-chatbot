@@ -3,9 +3,6 @@ import requests
 import re
 from groq import Groq
 
-# =========================
-# 🔑 KEYS
-# =========================
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
