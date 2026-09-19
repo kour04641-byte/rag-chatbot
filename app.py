@@ -3,11 +3,11 @@ import requests
 import re
 import groq
 
-# ✅ Secrets
+# ✅ Correct secrets
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
-# ✅ Client
+# ✅ Correct client
 client = groq.Client(api_key=GROQ_API_KEY)
 # =========================
 # 🔑 KEYS
