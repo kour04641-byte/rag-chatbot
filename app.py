@@ -1,14 +1,15 @@
 import streamlit as st
 import requests
 import re
-import groq
+from groq import Groq
 
-# ✅ Correct secrets
+# =========================
+# 🔑 KEYS
+# =========================
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
-# ✅ Correct client
-client = groq.Client(api_key=GROQ_API_KEY)
+client = Groq(api_key=GROQ_API_KEY)
 # =========================
 # 🔑 KEYS
 # =========================
