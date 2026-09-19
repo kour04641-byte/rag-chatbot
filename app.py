@@ -3,8 +3,11 @@ import requests
 import re
 import groq
 
-client = groq.Client(api_key=GROQ_API_KEY)
+# ✅ DEFINE FIRST
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 
+# ✅ THEN USE
+client = groq.Client(api_key=GROQ_API_KEY)
 # =========================
 # 🔑 KEYS
 # =========================
