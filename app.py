@@ -10,11 +10,11 @@ client = Groq(api_key=GROQ_API_KEY)
 # =========================
 # 🔑 KEYS
 # =========================
-groq.client_API_KEY = st.secrets["groq.client_API_KEY"]
+
+GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
-client = groq.client(api_key=groq.client_API_KEY)
-
+client = Groq(api_key=GROQ_API_KEY)
 # =========================
 # PAGE CONFIG
 # =========================
