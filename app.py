@@ -1,20 +1,16 @@
 import streamlit as st
 import requests
 import re
-from groq import Groq
+import groq
 
+# =========================
+# 🔐 SECRETS
+# =========================
 GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
 
-client = Groq(api_key=GROQ_API_KEY)
-# =========================
-# 🔑 KEYS
-# =========================
+client = groq.Client(api_key=GROQ_API_KEY)
 
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
-
-client = Groq(api_key=GROQ_API_KEY)
 # =========================
 # PAGE CONFIG
 # =========================
@@ -49,15 +45,18 @@ st.markdown("""
 st.title("🤖 MyAI Chat")
 
 # =========================
-# SIDEBAR
+# SESSION
 # =========================
-st.sidebar.title("💬 Chats")
-
 if "chats" not in st.session_state:
     st.session_state.chats = {"Chat 1": []}
 
 if "current_chat" not in st.session_state:
     st.session_state.current_chat = "Chat 1"
+
+# =========================
+# SIDEBAR
+# =========================
+st.sidebar.title("💬 Chats")
 
 if st.sidebar.button("➕ New Chat"):
     name = f"Chat {len(st.session_state.chats)+1}"
@@ -110,50 +109,70 @@ def google_search(query):
 # =========================
 def clean_output(text):
 
-    text = text.replace("Cov⁡", "\\operatorname{Cov}")
-    text = text.replace("Var⁡", "\\operatorname{Var}")
-    text = text.replace("Corr⁡", "\\operatorname{Corr}")
-
+    # Fix symbols
     text = text.replace("β", "\\beta")
     text = text.replace("ε", "\\varepsilon")
-    text = text.replace("β^", "\\hat{\\beta}")
 
-    # ✅ FIXED FUNCTION
-    def fix_formula(match):
-        content = match.group(1).strip()
+    # ✅ Convert math blocks → $$...$$
+    text = re.sub(r"```math\s*(.*?)\s*```", r"$$\1$$", text, flags=re.DOTALL)
 
-        # Only convert if looks like math
-        if re.search(r"[=+\-*/^]", content):
-            content = re.sub(r"[,\.\s]+$", "", content)
-            return f"$$ {content} $$"
-
-        return f"[{content}]"
-
-    def fix_table(match):
-        table = match.group()
-        return re.sub(r"\$\$.*?\$\$", "[formula below]", table)
-
-    # ✅ Order fixed
-    text = re.sub(r"(\|.*\|(?:\n\|.*\|)+)", fix_table, text)
-    text = re.sub(r"\[(.*?)\]", fix_formula, text, flags=re.DOTALL)
+    # ✅ Fix broken <br> inside tables
+    text = text.replace("\\<br>", "\n")
+    text = text.replace("<br>", "\n")
 
     return text
 
 # =========================
-# 🔥 RENDER (FIXED)
+# 🔥 RENDER ENGINE (FINAL)
 # =========================
+import pandas as pd
+
+def parse_table(markdown_table):
+    lines = [line.strip() for line in markdown_table.strip().split("\n") if line.strip()]
+
+    # Remove separator row (----)
+    if len(lines) > 1 and set(lines[1].replace("|", "").strip()) <= {"-", " "}:
+        lines.pop(1)
+
+    table_data = []
+    for line in lines:
+        row = [cell.strip() for cell in line.strip("|").split("|")]
+        table_data.append(row)
+
+    # Make all rows same length
+    max_cols = max(len(r) for r in table_data)
+    table_data = [r + [""] * (max_cols - len(r)) for r in table_data]
+
+    # First row = header
+    df = pd.DataFrame(table_data[1:], columns=table_data[0])
+
+    return df
+
+
 def render(text):
     text = clean_output(text)
 
+    # Split formulas first
     parts = re.split(r"(\$\$.*?\$\$)", text, flags=re.DOTALL)
 
     for part in parts:
+        part = part.strip()
+
+        # ✅ FORMULA (UNCHANGED)
         if part.startswith("$$") and part.endswith("$$"):
-            formula = part[2:-2].strip()
-            st.latex(formula)   # ✅ perfect rendering
+            st.latex(part[2:-2].strip())
+
+        # ✅ TABLE DETECTION
+        elif "|" in part and "\n" in part:
+            try:
+                df = parse_table(part)
+                st.dataframe(df, use_container_width=True)
+            except:
+                st.markdown(part)
+
+        # ✅ NORMAL TEXT
         else:
             st.markdown(part)
-
 # =========================
 # AI RESPONSE
 # =========================
@@ -165,9 +184,14 @@ def get_response(prompt):
 You are ChatGPT-level AI.
 
 STRICT RULES:
-- Tables: text only
-- Formulas: MUST be in $$...$$ format only
+- Tables must be plain text (no formulas inside tables)
+- Use $$...$$ for formulas ONLY
+- DO NOT use ```math blocks
 - Clean formatting
+- Tables must NOT use <br>
+- Use new lines instead of <br>
+- Do NOT put formulas inside tables
+- Use $$...$$ only outside tables
 
 Context:
 {google_data}
@@ -185,13 +209,14 @@ Context:
     return response.choices[0].message.content
 
 # =========================
-# INPUT + AUTO RENAME
+# INPUT
 # =========================
 user_input = st.chat_input("Ask anything...")
 
 if user_input:
     messages.append({"role": "user", "content": user_input})
 
+    # Auto rename
     if st.session_state.current_chat.startswith("Chat"):
         new_name = user_input[:30].strip()
 
