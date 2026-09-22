@@ -29,11 +29,31 @@ st.set_page_config(page_title="Omnix.ai", page_icon="🌀", layout="wide")
 # =========================
 # 🔐 SECRETS
 # =========================
-GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
-SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
-OPENROUTER_API_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
+# FIX (unlimited free chats for users): a single free Groq/OpenRouter key has its own daily
+# quota, and every user of the deployed app shares that ONE quota - so a handful of active
+# users could exhaust it for everyone. Instead of one key, we now accept a POOL of keys (each
+# from a separate free account) and rotate through the whole pool whenever one is rate-limited,
+# so the app effectively has (number of keys) x (number of free daily quotas) before anyone
+# ever sees a limit message.
+#
+# In Secrets, set:
+#   GROQ_API_KEYS = "key1, key2, key3"        (comma or newline separated - add as many free
+#                                               Groq accounts' keys as you want)
+#   OPENROUTER_API_KEYS = "key1, key2"        (same idea, optional)
+# GROQ_API_KEY / OPENROUTER_API_KEY (singular) still work as a fallback if you only have one key.
+def _split_keys(raw) -> list:
+    if not raw:
+        return []
+    items = raw if isinstance(raw, (list, tuple)) else re.split(r"[,\n]+", str(raw))
+    return [k.strip() for k in items if k.strip()]
 
-client = groq.Client(api_key=GROQ_API_KEY)
+GROQ_API_KEYS = _split_keys(st.secrets.get("GROQ_API_KEYS", "")) or _split_keys(st.secrets["GROQ_API_KEY"])
+SERPER_API_KEY = st.secrets["SERPER_API_KEY"]
+OPENROUTER_API_KEYS = _split_keys(st.secrets.get("OPENROUTER_API_KEYS", "")) or _split_keys(st.secrets.get("OPENROUTER_API_KEY", ""))
+OPENROUTER_API_KEY = OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else ""  # back-compat for any old reference
+
+GROQ_CLIENTS = [groq.Client(api_key=k) for k in GROQ_API_KEYS]
+client = GROQ_CLIENTS[0]  # default client kept for any code path that still uses it directly
 
 # =========================
 # SETTINGS  (tune these)
@@ -1320,12 +1340,15 @@ def _retry_after(err) -> float:
     return 60.0
 
 
-def _call_openrouter(msgs: list, model_name: str, temp: float):
+def _call_openrouter(msgs: list, model_name: str, temp: float, api_key: str = None):
+    key = api_key or (OPENROUTER_API_KEYS[0] if OPENROUTER_API_KEYS else "")
+    if not key:
+        return None
     try:
         r = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Authorization": f"Bearer {key}",
                 "Content-Type": "application/json",
             },
             json={"model": model_name, "temperature": temp, "messages": msgs},
@@ -1346,8 +1369,9 @@ def _busy_message(soonest: float) -> str:
         when = f"about {mins} min"
     else:
         when = "a few minutes"
-    return (f"All AI models have reached their free-tier limits right now (daily token quota). "
-            f"Please try again in {when}, or add an OPENROUTER_API_KEY in Secrets for a second free quota.")
+    return (f"All AI models/accounts have reached their free-tier limits right now (daily token "
+            f"quota). Please try again in {when}, or add more keys to GROQ_API_KEYS / "
+            f"OPENROUTER_API_KEYS in Secrets for extra free quota.")
 
 
 def chat_complete(messages: list, temperature: float = 0.6, preferred: str = None,
@@ -1355,38 +1379,42 @@ def chat_complete(messages: list, temperature: float = 0.6, preferred: str = Non
     preferred = preferred or SLIDES_MODEL
     order = [preferred] + [m for m in MODELS if m != preferred]
     soonest = float("inf")
+    # FIX (unlimited free chats for users): try every (model, key) pair - a model's quota is
+    # per-key, so before giving up on a model entirely we rotate through every Groq key in the
+    # pool for it, not just the first one.
     for model in order:
-        use_json = json_mode
-        for attempt in range(3):
-            kw = dict(model=model, temperature=temperature, messages=messages)
-            if max_tokens:
-                kw["max_tokens"] = max_tokens
-            if use_json:
-                kw["response_format"] = {"type": "json_object"}
-            if model.startswith("openai/gpt-oss"):
-                kw["extra_body"] = {"reasoning_effort": "low"}
-            try:
-                resp = client.chat.completions.create(**kw)
-                return resp.choices[0].message.content or ""
-            except groq.RateLimitError as e:
-                wait = _retry_after(e)
-                soonest = min(soonest, wait)
-                if wait <= MAX_SHORT_WAIT and attempt < 2:
-                    time_sleep(wait + 0.5)
-                    continue
-                break                              # long wait -> next model
-            except groq.BadRequestError:
-                if use_json:                       # model may not support JSON mode
-                    use_json = False
-                    continue
-                break
-            except groq.APIStatusError as e:
-                if e.status_code in (413, 500, 502, 503):
-                    break                          # too large / server busy -> next model
-                break                              # any other status (e.g. 404 retired model id) -> next model too
-    if OPENROUTER_API_KEY:
-        for cand in OPENROUTER_MODELS:
-            text = _call_openrouter(messages, cand, temperature)
+        for gclient in GROQ_CLIENTS:
+            use_json = json_mode
+            for attempt in range(3):
+                kw = dict(model=model, temperature=temperature, messages=messages)
+                if max_tokens:
+                    kw["max_tokens"] = max_tokens
+                if use_json:
+                    kw["response_format"] = {"type": "json_object"}
+                if model.startswith("openai/gpt-oss"):
+                    kw["extra_body"] = {"reasoning_effort": "low"}
+                try:
+                    resp = gclient.chat.completions.create(**kw)
+                    return resp.choices[0].message.content or ""
+                except groq.RateLimitError as e:
+                    wait = _retry_after(e)
+                    soonest = min(soonest, wait)
+                    if wait <= MAX_SHORT_WAIT and attempt < 2:
+                        time_sleep(wait + 0.5)
+                        continue
+                    break                              # long wait -> next key, then next model
+                except groq.BadRequestError:
+                    if use_json:                       # model may not support JSON mode
+                        use_json = False
+                        continue
+                    break
+                except groq.APIStatusError as e:
+                    if e.status_code in (413, 500, 502, 503):
+                        break                          # too large / server busy -> next key/model
+                    break                              # any other status (e.g. 404 retired model id) -> next
+    for cand in OPENROUTER_MODELS:
+        for okey in OPENROUTER_API_KEYS:
+            text = _call_openrouter(messages, cand, temperature, okey)
             if text:
                 return text
     raise AllModelsBusy(_busy_message(soonest))
@@ -1412,6 +1440,221 @@ def enhance_prompt_ai(prompt: str) -> str:
         ).strip() or prompt
     except Exception:
         return prompt
+
+
+# ---------------------------------------------------------------------------
+# FIX (docx always used Word's default font, ignoring the user's request):
+# markdown_to_docx() never looked at font at all - "make it Times New Roman"
+# had nowhere to go. FONT_MAP recognises common font names (including the
+# "new times roman" word order people often type), extract_font_request()
+# finds one anywhere in the message, and strip_font_instruction() removes
+# that clause from the topic before it's sent to the writer model so the
+# document is actually ABOUT the topic, not about fonts. apply_font_everywhere()
+# then force-sets that font on every run - title, headings, body, bullets,
+# and table cells - since python-docx's built-in heading/list styles don't
+# inherit the "Normal" style's font by default.
+# ---------------------------------------------------------------------------
+FONT_MAP = {
+    "times new roman": "Times New Roman",
+    "new times roman": "Times New Roman",   # common reversed phrasing
+    "times roman": "Times New Roman",
+    "arial": "Arial",
+    "calibri": "Calibri",
+    "cambria": "Cambria",
+    "georgia": "Georgia",
+    "garamond": "Garamond",
+    "verdana": "Verdana",
+    "tahoma": "Tahoma",
+    "helvetica": "Helvetica",
+    "courier new": "Courier New",
+    "courier": "Courier New",
+    "book antiqua": "Book Antiqua",
+    "century gothic": "Century Gothic",
+    "comic sans ms": "Comic Sans MS",
+    "comic sans": "Comic Sans MS",
+}
+# FIX ("font type should be calibiri" was ignored entirely): the old pattern only matched an
+# EXACT, pre-listed font name right after "font" - so an extra word ("font TYPE should be...",
+# "font STYLE...") or a small typo ("calibiri" instead of "calibri") meant nothing matched at
+# all. The clause stayed in the message, polluted the topic sent to the writer model, and the
+# font was silently never applied. Now the pattern captures whatever word(s) follow a font
+# clause generically, and _closest_font() resolves that against FONT_MAP by fuzzy match, so
+# ordinary typos and phrasing variants ("font type/style/face", "font is", "in X font") work.
+_FONT_LEAD_RE = re.compile(
+    r"[,.]?\s*(?:and\s+)?(?:the\s+)?font(?:\s+(?:type|style|face))?\s*"
+    r"(?:should\s+be|must\s+be|needs?\s+to\s+be|is|as|:)?\s*"
+    r"([A-Za-z][A-Za-z\s]{1,24}?)(?:\s+font)?(?=[,.!?]|$|\s+and\b)",
+    re.I,
+)
+_FONT_USE_RE = re.compile(
+    r"[,.]?\s*(?:in|using|use|with)\s+(?:the\s+)?([A-Za-z][A-Za-z\s]{1,24}?)\s+font\b",
+    re.I,
+)
+
+
+def _closest_font(candidate: str):
+    import difflib
+    cand = candidate.strip().lower()
+    if not cand:
+        return None
+    hit = difflib.get_close_matches(cand, FONT_MAP.keys(), n=1, cutoff=0.72)
+    if hit:
+        return FONT_MAP[hit[0]]
+    lower_values = {v.lower(): v for v in FONT_MAP.values()}
+    hit = difflib.get_close_matches(cand, lower_values.keys(), n=1, cutoff=0.72)
+    return lower_values[hit[0]] if hit else None
+
+
+def extract_and_strip_font(text: str):
+    """Returns (font_name_or_None, text_with_the_font_clause_removed).
+    font_name is None if a font clause was found but couldn't be resolved to a known font -
+    the clause is still stripped either way so it doesn't pollute the document's topic."""
+    for pattern in (_FONT_LEAD_RE, _FONT_USE_RE):
+        m = pattern.search(text)
+        if not m:
+            continue
+        font_name = _closest_font(m.group(1))
+        cleaned = (text[:m.start()] + text[m.end():])
+        cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .,")
+        return font_name, (cleaned or text)
+    return None, text
+
+
+def _set_run_font(run, font_name: str):
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    run.font.name = font_name
+    rPr = run._element.get_or_add_rPr()
+    rFonts = rPr.find(qn("w:rFonts"))
+    if rFonts is None:
+        rFonts = OxmlElement("w:rFonts")
+        rPr.append(rFonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+        rFonts.set(qn(attr), font_name)
+
+
+def apply_font_everywhere(doc, font_name: str):
+    doc.styles["Normal"].font.name = font_name
+    for p in doc.paragraphs:
+        for r in p.runs:
+            _set_run_font(r, font_name)
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    for r in p.runs:
+                        _set_run_font(r, font_name)
+
+
+# ---------------------------------------------------------------------------
+# FIX ("font size should be 19" was ignored, and there was no way to name the
+# output file): two more instructions markdown_to_docx() had nowhere to send.
+# extract_and_strip_size() understands a size tied to a part of the document -
+# "subheadings should be 19", "heading size 20", "body text 12pt", or a bare
+# "font size 19" (which is treated as the body size, leaving the big topic
+# title alone unless the user gives a title size too - exactly the "topic
+# heading should stay big, subheadings should be 19" behaviour asked for).
+# extract_and_strip_filename() picks up "name/call/save it as ..." and is used
+# as the actual output filename instead of one auto-built from the topic.
+# apply_font_sizes() then sets the point size on every run of the matching
+# part of the document (Title style / Heading N styles / everything else).
+# ---------------------------------------------------------------------------
+_SIZE_QUAL = r"(title|topic heading|main heading|main title|sub ?headings?|headings?|body(?:\s*text)?|paragraph(?:\s*text)?|text)"
+_SIZE_CONNECTOR = r"(?:should\s+be|must\s+be|needs?\s+to\s+be|is|as|of|:)"
+_SIZE_PATTERNS = [
+    # "heading size 20", "font size 19", "body text size 12pt" - qualifier optional, "size" required
+    re.compile(
+        rf"\b(?:{_SIZE_QUAL}\s+)?(?:font\s*)?size\s*{_SIZE_CONNECTOR}?\s*(\d{{1,2}})(?:\s*(?:pt|point|px))?\b",
+        re.I,
+    ),
+    # "subheadings should be 19", "title should be 24pt" - qualifier + connector required, no "size" word needed
+    re.compile(
+        rf"\b{_SIZE_QUAL}\s+(?:font\s*)?{_SIZE_CONNECTOR}\s*(\d{{1,2}})(?:\s*(?:pt|point|px))?\b",
+        re.I,
+    ),
+    # "body text 12pt", "heading 20pt" - qualifier directly followed by a number WITH an explicit unit,
+    # no "size" word or connector needed since the unit itself is an unambiguous signal
+    re.compile(
+        rf"\b{_SIZE_QUAL}\s+(\d{{1,2}})\s*(?:pt|point|px)\b",
+        re.I,
+    ),
+]
+
+
+def _size_category(qual: str) -> str:
+    qual = (qual or "").strip().lower()
+    if qual in ("title", "topic heading", "main heading", "main title"):
+        return "title"
+    if qual.startswith("head") or qual.startswith("sub"):
+        return "heading"
+    return "body"
+
+
+def extract_and_strip_size(text: str):
+    """Returns ({'title': pt_or_None, 'heading': pt_or_None, 'body': pt_or_None}, cleaned_text)."""
+    sizes = {"title": None, "heading": None, "body": None}
+    spans = []
+    for pattern in _SIZE_PATTERNS:
+        for m in pattern.finditer(text):
+            num = int(m.group(m.re.groups))
+            if not (6 <= num <= 96):
+                continue
+            qual = next((g for g in m.groups()[:-1] if g), "")
+            cat = _size_category(qual)
+            if sizes[cat] is None:
+                sizes[cat] = num
+            spans.append((m.start(), m.end()))
+    cleaned = text
+    for start, end in sorted(set(spans), reverse=True):
+        pre = cleaned[:start]
+        pre = re.sub(r"[,]?\s*(?:and\s+)?(?:the\s+)?$", "", pre)
+        cleaned = pre + cleaned[end:]
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .,")
+    return sizes, (cleaned or text)
+
+
+_FILENAME_PATTERN = re.compile(
+    r"[,.]?\s*(?:and\s+)?(?:name|rename|call|save)\s+(?:it|this|the file|this file|this document)?\s*"
+    r"(?:as|to|:)?\s*[\"“]?([A-Za-z0-9][A-Za-z0-9 _\-]{1,60}?)[\"”]?"
+    r"(?:\.docx)?(?=[,.!?]|$)",
+    re.I,
+)
+
+
+def extract_and_strip_filename(text: str):
+    """Returns (filename_without_extension_or_None, cleaned_text)."""
+    m = _FILENAME_PATTERN.search(text)
+    if not m:
+        return None, text
+    name = m.group(1).strip()
+    cleaned = (text[:m.start()] + text[m.end():])
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" .,")
+    return name, (cleaned or text)
+
+
+def apply_font_sizes(doc, title_size=None, heading_size=None, body_size=None):
+    from docx.shared import Pt
+
+    def walk(paragraphs):
+        for p in paragraphs:
+            style_name = p.style.name if p.style else ""
+            if style_name.startswith("Title"):
+                size = title_size
+            elif style_name.startswith("Heading"):
+                size = heading_size
+            else:
+                size = body_size
+            if not size:
+                continue
+            for r in p.runs:
+                r.font.size = Pt(size)
+
+    walk(doc.paragraphs)
+    for tbl in doc.tables:
+        for row in tbl.rows:
+            for cell in row.cells:
+                walk(cell.paragraphs)
 
 
 def generate_doc_content(topic: str) -> str:
@@ -1507,7 +1750,10 @@ def _add_horizontal_rule(doc):
     p_pr.append(borders)
 
 
-def markdown_to_docx(text: str, title: str) -> bytes:
+def markdown_to_docx(
+    text: str, title: str, font_name: str | None = None,
+    title_size: int | None = None, heading_size: int | None = None, body_size: int | None = None,
+) -> bytes:
     docx = _import("docx", "python-docx")
     from docx.shared import Pt
     from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -1575,6 +1821,11 @@ def markdown_to_docx(text: str, title: str) -> bytes:
                 p = d.add_paragraph()
                 _add_rich_text(p, line)
 
+    if font_name:
+        apply_font_everywhere(d, font_name)
+    if title_size or heading_size or body_size:
+        apply_font_sizes(d, title_size=title_size, heading_size=heading_size, body_size=body_size)
+
     buf = io.BytesIO()
     d.save(buf)
     return buf.getvalue()
@@ -1584,13 +1835,23 @@ CREATION_VERBS = r"(generate|create|make|build|draw|paint|design|draft|write|add
 SLIDE_WORDS = r"(ppt|powerpoint|slide ?deck|slides?|presentation|deck)"
 IMAGE_WORDS = r"(image|picture|photo|artwork|illustration|logo|poster)"
 VISUAL_WORDS = r"(visual|graphic|graph|chart|diagram|icon|infographic)"
+# FIX (requests silently falling through to plain chat): the verb had to be the
+# very first word, so natural phrasing like "Hey, can you create a word file..."
+# or "I need you to make a report on..." never matched at all, and with no
+# real file-creation tool the chat model just typed something file-shaped as
+# plain text instead of actually making one. A short, common lead-in is now
+# allowed before the verb.
+LEAD_IN = (
+    r"(?:(?:hi|hey|hello)[,\s]+)?(?:(?:can|could|would)\s+you\s+)?(?:please[,\s]+)?"
+    r"(?:i\s+(?:want|need|would like)\s+(?:you\s+to\s+)?)?"
+)
 
 
 def detect_intent(text: str):
     """Fresh 'make me a whole new thing' requests. Follow-up edits to an existing
     deck are handled separately in the chat loop (see detect_edit)."""
     t = text.strip().lower()
-    if not re.match(rf"^(please[,\s]+)?{CREATION_VERBS}\b", t):
+    if not re.match(rf"^{LEAD_IN}{CREATION_VERBS}\b", t):
         return None
     # FIX (misunderstood requests): "give impressive speaker notes for the ppt attached...
     # of each slide" used to trigger a brand-new deck build, just because "give" is a
@@ -1605,11 +1866,17 @@ def detect_intent(text: str):
     ))
     if references_existing_file:
         return None
-    if re.match(rf"^(please[,\s]+)?{CREATION_VERBS}\s+(me\s+)?(an?\s+|the\s+|some\s+|a few\s+)?{SLIDE_WORDS}\b", t):
+    if re.match(rf"^{LEAD_IN}{CREATION_VERBS}\s+(me\s+)?(an?\s+|the\s+|some\s+|a few\s+)?{SLIDE_WORDS}\b", t):
         return "slides"
     if re.search(rf"\b{IMAGE_WORDS}\b", t) and not re.search(rf"\b{SLIDE_WORDS}\b", t):
         return "image"
-    if re.search(r"\b(word doc(ument)?|\.docx|report)\b", t):
+    # FIX ("create a word file" gave a base64 string in chat instead of a real .docx): the
+    # doc-intent trigger only recognised "word doc"/"word document"/".docx"/"report" - so
+    # "word FILE" (a completely normal way to ask for one) never matched, the request fell
+    # through to plain chat, and the chat model - with no actual file-creation tool - tried
+    # to comply by typing something file-like in the reply text instead of really making one.
+    if re.search(r"\b(word doc(ument)?|word file|docx( file)?|doc file|\.docx\b|\.doc\b|"
+                 r"ms ?word|microsoft word|report)\b", t):
         return "doc"
     return None
 
@@ -1625,7 +1892,7 @@ def detect_edit(text: str, has_deck: bool):
     # form" (complaining about formatting, not the deck) got read as a deck edit and the
     # whole presentation was silently regenerated. Now only an explicit, unambiguous deck
     # reference counts.
-    starts_like_edit = bool(re.search(rf"^(please[,\s]+)?{CREATION_VERBS}\b", t)) or \
+    starts_like_edit = bool(re.search(rf"^{LEAD_IN}{CREATION_VERBS}\b", t)) or \
         bool(re.search(r"\b(the deck|the slides|the presentation|the pptx?|"
                         r"this (ppt|deck|presentation|pptx)|that (ppt|deck|presentation|pptx))\b", t))
     if not starts_like_edit:
@@ -1634,6 +1901,30 @@ def detect_edit(text: str, has_deck: bool):
                       or "chart" in t or "graph" in t or "table" in t or "timeline" in t):
         return "slides"
     return None
+
+
+# FIX ("i want the font type as calibri" after a doc was already generated went nowhere): a
+# follow-up formatting tweak rarely starts with a creation verb ("create"/"make"...), so
+# detect_intent never fired for it, and with no doc-editing path at all it fell through to
+# plain chat - where the model, unable to actually touch the file, apologised and dumped
+# copy-paste text instead of just reformatting the real .docx. This catches that class of
+# follow-up (font / size / heading / rename mentions, once a doc already exists in the chat)
+# so it can be handled by re-applying formatting to the SAME content instead of starting over.
+_DOC_FORMAT_RE = re.compile(
+    r"\b(font|" + "|".join(re.escape(k) for k in FONT_MAP) + r"|size|pt|point|heading|subheading|"
+    r"rename|call it|name it|name the file|bigger|smaller|larger)\b",
+    re.I,
+)
+
+
+def detect_doc_edit(text: str, has_doc: bool) -> bool:
+    """Is this a formatting-only follow-up to a Word doc already generated in this chat?"""
+    if not has_doc:
+        return False
+    t = text.strip().lower()
+    if re.match(rf"^{LEAD_IN}{CREATION_VERBS}\b", t):
+        return False  # looks like a fresh request - detect_intent already handles that
+    return bool(_DOC_FORMAT_RE.search(t))
 
 
 def extract_image_prompt(text: str) -> str:
@@ -2646,13 +2937,14 @@ def _vision_messages(mime: str, b64: str) -> list:
     }]
 
 
-def _call_groq_vision(model_name: str, messages: list):
-    """One attempt (with short-wait retries) against a Groq vision model. Returns text, or None
-    on anything that should fall through to the next model (including a deprecated/renamed
-    model id -> 404 model_not_found, which must NEVER crash the whole read)."""
+def _call_groq_vision(model_name: str, messages: list, gclient=None):
+    """One attempt (with short-wait retries) against a Groq vision model on ONE key. Returns
+    text, or None on anything that should fall through to the next key/model (including a
+    deprecated/renamed model id -> 404 model_not_found, which must NEVER crash the whole read)."""
+    gclient = gclient or client
     for attempt in range(3):
         try:
-            resp = client.chat.completions.create(
+            resp = gclient.chat.completions.create(
                 model=model_name, temperature=0.15, max_tokens=3000, messages=messages,
             )
             text = resp.choices[0].message.content
@@ -2662,10 +2954,10 @@ def _call_groq_vision(model_name: str, messages: list):
             if wait <= MAX_SHORT_WAIT and attempt < 2:
                 time_sleep(wait + 0.5)
                 continue
-            return None                         # long wait -> let caller try the next model
+            return None                         # long wait -> let caller try the next key/model
         except groq.APIStatusError:
             # covers BadRequestError (400), NotFoundError (404 - deprecated/renamed model id),
-            # and every other 4xx/5xx: never fatal here, just try the next model in the chain.
+            # and every other 4xx/5xx: never fatal here, just try the next key/model in the chain.
             return None
         except Exception:
             return None
@@ -2674,26 +2966,28 @@ def _call_groq_vision(model_name: str, messages: list):
 
 def describe_image(name: str, data: bytes) -> str:
     """Reads an image's text and content: tries the primary Groq vision model, then a second
-    Groq vision model, then several free OpenRouter vision models, so a single busy/rate-limited
-    model never means the image's text silently gets skipped."""
+    Groq vision model - each across EVERY key in the pool - then several free OpenRouter vision
+    models (also across every OpenRouter key), so a single busy/rate-limited account never means
+    the image's text silently gets skipped."""
     mime = IMAGE_EXTS[Path(name).suffix.lower()]
     b64 = base64.b64encode(data).decode()
     messages = _vision_messages(mime, b64)
 
     for model_name in (VISION_MODEL, VISION_MODEL_FALLBACK):
-        text = _call_groq_vision(model_name, messages)
-        if text:
-            return text
+        for gclient in GROQ_CLIENTS:
+            text = _call_groq_vision(model_name, messages, gclient)
+            if text:
+                return text
 
-    if OPENROUTER_API_KEY:
-        for model_name in OPENROUTER_VISION_MODELS:
-            text = _call_openrouter(messages, model_name, 0.15)
+    for model_name in OPENROUTER_VISION_MODELS:
+        for okey in OPENROUTER_API_KEYS:
+            text = _call_openrouter(messages, model_name, 0.15, okey)
             if text and text.strip():
                 return text
 
     raise RuntimeError(
-        "Image reading is temporarily unavailable (all vision models are busy/rate-limited right "
-        "now). Please try again in a minute."
+        "Image reading is temporarily unavailable (all vision models/accounts are busy/rate-"
+        "limited right now). Please try again in a minute."
     )
 
 
@@ -2740,6 +3034,7 @@ st.session_state.setdefault("upload_msgs", [])
 st.session_state.setdefault("theme", "dark")
 st.session_state.setdefault("response_cache", {})
 st.session_state.setdefault("deck_specs", {})   # chat name -> last generated slide-deck spec (for edits)
+st.session_state.setdefault("doc_specs", {})    # chat name -> last generated Word doc spec (for edits)
 
 
 def select_chat(name):
@@ -2758,6 +3053,7 @@ def delete_chat(name):
     st.session_state.chats.pop(name, None)
     st.session_state.docs.pop(name, None)
     st.session_state.deck_specs.pop(name, None)
+    st.session_state.doc_specs.pop(name, None)
     if st.session_state.renaming == name:
         st.session_state.renaming = None
     if not st.session_state.chats:
@@ -2769,6 +3065,7 @@ def delete_chat(name):
 def clear_chat():
     st.session_state.chats[st.session_state.current_chat].clear()
     st.session_state.deck_specs.pop(st.session_state.current_chat, None)
+    st.session_state.doc_specs.pop(st.session_state.current_chat, None)
 
 
 def rename_chat(old, new):
@@ -2778,6 +3075,8 @@ def rename_chat(old, new):
         ss.docs[new] = ss.docs.pop(old)
     if old in ss.deck_specs:
         ss.deck_specs[new] = ss.deck_specs.pop(old)
+    if old in ss.doc_specs:
+        ss.doc_specs[new] = ss.doc_specs.pop(old)
     if ss.current_chat == old:
         ss.current_chat = new
 
@@ -3215,17 +3514,44 @@ with st.sidebar.expander("🎨 Creative Studio", expanded=False):
 
     with tab_doc:
         doc_topic = st.text_input("Document topic", key="doc_topic")
+        doc_font = st.selectbox(
+            "Font", ["Default (Calibri)"] + sorted(set(FONT_MAP.values())), key="doc_font",
+        )
+        dsz1, dsz2 = st.columns(2)
+        with dsz1:
+            doc_body_size = st.number_input(
+                "Body font size (pt)", min_value=0, max_value=72, value=0, key="doc_body_size",
+                help="0 = leave at Word's default",
+            )
+        with dsz2:
+            doc_heading_size = st.number_input(
+                "Heading/subheading size (pt)", min_value=0, max_value=72, value=0, key="doc_heading_size",
+                help="0 = leave at Word's default",
+            )
+        doc_filename = st.text_input(
+            "File name (optional)", key="doc_filename", placeholder="leave blank to name it from the topic",
+        )
         if st.button("Generate Word doc", key="gen_doc_btn", type="primary"):
             if doc_topic.strip():
                 with st.spinner("Writing your document..."):
                     try:
+                        chosen_font = None if doc_font == "Default (Calibri)" else doc_font
                         content = generate_doc_content(doc_topic.strip())
-                        doc_bytes = markdown_to_docx(content, doc_topic.strip())
+                        doc_bytes = markdown_to_docx(
+                            content, doc_topic.strip(), font_name=chosen_font,
+                            body_size=doc_body_size or None, heading_size=doc_heading_size or None,
+                        )
+                        file_stem = safe_filename(doc_filename) if doc_filename.strip() else safe_filename(doc_topic)
+                        st.session_state.doc_specs[st.session_state.current_chat] = {
+                            "content": content, "topic": doc_topic.strip(), "font_name": chosen_font,
+                            "sizes": {"title": None, "heading": doc_heading_size or None, "body": doc_body_size or None},
+                            "filename": file_stem,
+                        }
                         messages.append({
                             "role": "assistant",
                             "content": f"📄 Generated a Word document on: *{doc_topic.strip()}*",
                             "file": {
-                                "name": f"{safe_filename(doc_topic)}.docx",
+                                "name": f"{file_stem}.docx",
                                 "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                                 "data": base64.b64encode(doc_bytes).decode(),
                             },
@@ -3384,6 +3710,10 @@ def build_system_prompt(history, kb, web_on, style_name):
         "anything similar, answer that Japneet Kour created you. Say this plainly and "
         "confidently, as simple fact - do not hedge, qualify, or add technical detail beyond "
         "it unless asked for more.\n"
+        "- If asked WHEN you were created/made/built, or your creation date, answer simply "
+        "that you were created in September 2026. Give that one month/year as a plain fact - "
+        "do not describe a range of years (e.g. never say anything like '2023-2026'), a "
+        "training period, or a vague/hedged timeframe.\n"
         "- If asked who or what you are, your name, or which company/model/AI you are powered "
         "by (without asking specifically who created/made you), answer simply that you are "
         "Omnix.ai, an AI assistant. Do not say more than that about your internals unless the "
@@ -3456,6 +3786,81 @@ def build_system_prompt(history, kb, web_on, style_name):
             "slides clearly and cover every single one - never stop partway through the deck.\n"
         )
 
+    # FIX (LinkedIn post came out half in a table, wrong register): the app was answering
+    # "write me a LinkedIn post" with the same generic prose/table instincts as any other
+    # question. Real platform content has its own conventions - detect the platform being
+    # asked for and switch to format that actually matches how people post there.
+    platform_match = re.search(
+        r"\b(linkedin|instagram|insta|twitter|\bx\b(?=.*\bpost\b)|facebook|fb|youtube|"
+        r"tiktok|whatsapp)\b.{0,25}\b(post|caption|status|update|bio|description|script|reel)\b|"
+        r"\b(post|caption)\b.{0,25}\b(linkedin|instagram|insta|twitter|facebook|youtube|tiktok)\b",
+        last_user, re.I,
+    )
+    if platform_match:
+        platform_text = platform_match.group(0).lower()
+        if "linkedin" in platform_text:
+            platform_rule = (
+                "\nCONTENT FORMAT - LinkedIn post: write it exactly as it should be copy-pasted "
+                "and published, not an explanation about it.\n"
+                "- Plain text only: NO markdown table, NO headers, NO bullet/asterisk symbols "
+                "(LinkedIn renders none of that) - use short paragraphs and line breaks instead.\n"
+                "- Hook: the first 1-2 lines must earn the 'see more' click - a bold claim, "
+                "question, or surprising fact, not a throat-clearing intro.\n"
+                "- Body: 3-6 short paragraphs (1-3 lines each) with real substance - a concrete "
+                "story, numbers, or a specific insight, not generic advice. Use line breaks "
+                "generously; LinkedIn readers skim.\n"
+                "- Tone: professional but personal/first-person, like an expert sharing a real "
+                "take - not a press release.\n"
+                "- End with a clear call-to-action or a question that invites comments.\n"
+                "- Finish with 3-5 relevant hashtags on their own line(s), no more.\n"
+                "- Sprinkle at most a couple of tasteful emojis as visual anchors, never one per "
+                "line.\n"
+            )
+        elif "instagram" in platform_text or "insta" in platform_text or "reel" in platform_text:
+            platform_rule = (
+                "\nCONTENT FORMAT - Instagram caption: plain text only, no tables/headers.\n"
+                "- Short, punchy, visual-first tone; the image/video carries the message, the "
+                "caption adds voice, a hook, or a story beat.\n"
+                "- Line breaks between thoughts, liberal (tasteful) emoji use is normal here.\n"
+                "- End with a call-to-action (save/share/comment/tag a friend) and a hashtag "
+                "block of 8-20 relevant tags on its own line at the end.\n"
+            )
+        elif "twitter" in platform_text or re.search(r"\bx\b", platform_text):
+            platform_rule = (
+                "\nCONTENT FORMAT - X/Twitter post: plain text only, no tables/headers.\n"
+                "- Punchy and tight; lead with the sharpest line, not a wind-up. If the idea "
+                "needs more room, write it as a numbered thread (1/, 2/, 3/...), each tweet able "
+                "to stand alone.\n"
+                "- Minimal or no hashtags; at most 1-2 if genuinely useful.\n"
+            )
+        elif "facebook" in platform_text or platform_text.strip() == "fb":
+            platform_rule = (
+                "\nCONTENT FORMAT - Facebook post: plain text only, no tables/headers.\n"
+                "- Conversational, slightly longer-form than Instagram is fine; storytelling "
+                "and direct address to the reader work well here.\n"
+                "- End with a clear question or call-to-action to invite comments/shares.\n"
+            )
+        elif "youtube" in platform_text:
+            platform_rule = (
+                "\nCONTENT FORMAT - YouTube description/script: plain text only, no tables.\n"
+                "- Description: first 1-2 lines are what shows before 'show more', so put the "
+                "hook and key value there; include relevant keywords naturally; a timestamp "
+                "list or links section is fine further down.\n"
+                "- Script: write it as spoken words with a clear hook in the first 5 seconds, "
+                "not as bullet notes.\n"
+            )
+        else:
+            platform_rule = (
+                "\nCONTENT FORMAT: write this as ready-to-post plain text matching how people "
+                "actually write on that platform - no markdown table, no headers, short "
+                "paragraphs/line breaks, and hashtags only if that platform's readers expect "
+                "them.\n"
+            )
+        prompt += platform_rule + (
+            "This is a rule about THIS specific request, not a general ban - tables/headers are "
+            "still fine any other time they're actually asked for or genuinely useful.\n"
+        )
+
     if kb:
         listing = "; ".join(f"{f['name']} ({f['kind']})" for f in kb["files"])
         prompt += f"""
@@ -3514,51 +3919,55 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
     candidates = [model_name] + [m for m in MODELS if m != model_name]
     soonest = float("inf")
 
+    # FIX (unlimited free chats for users): rotate through every Groq key in the pool for each
+    # model before moving on to the next model - this is the main chat path (used on every
+    # single message), so this is where key-pooling matters most for "users never hit a limit".
     for candidate in candidates:
-        for attempt in range(3):
-            try:
-                kw = dict(
-                    model=candidate, temperature=temp, stream=True, messages=msgs,
-                    # FIX: previously unset, so a long "cover all 11 slides in detail" reply
-                    # could get silently truncated by whatever low default the API falls
-                    # back to.
-                    max_tokens=8000,
-                )
-                # FIX (free-tier quota running out too fast): gpt-oss models spend a large,
-                # hidden "reasoning" token budget on every single reply on top of the visible
-                # answer, and that reasoning spend counts against the same daily quota. The
-                # non-streaming helper (chat_complete, used for slides/images/etc.) already
-                # turned this down; the main chat path - the one actually used on every
-                # message - was missing it, so ordinary chatting was burning through the
-                # daily quota far faster than necessary.
-                if candidate.startswith("openai/gpt-oss"):
-                    kw["extra_body"] = {"reasoning_effort": "low"}
-                stream = client.chat.completions.create(**kw)
-                for chunk in stream:
-                    if not chunk.choices:
+        for gclient in GROQ_CLIENTS:
+            for attempt in range(3):
+                try:
+                    kw = dict(
+                        model=candidate, temperature=temp, stream=True, messages=msgs,
+                        # FIX: previously unset, so a long "cover all 11 slides in detail" reply
+                        # could get silently truncated by whatever low default the API falls
+                        # back to.
+                        max_tokens=8000,
+                    )
+                    # FIX (free-tier quota running out too fast): gpt-oss models spend a large,
+                    # hidden "reasoning" token budget on every single reply on top of the visible
+                    # answer, and that reasoning spend counts against the same daily quota. The
+                    # non-streaming helper (chat_complete, used for slides/images/etc.) already
+                    # turned this down; the main chat path - the one actually used on every
+                    # message - was missing it, so ordinary chatting was burning through the
+                    # daily quota far faster than necessary.
+                    if candidate.startswith("openai/gpt-oss"):
+                        kw["extra_body"] = {"reasoning_effort": "low"}
+                    stream = gclient.chat.completions.create(**kw)
+                    for chunk in stream:
+                        if not chunk.choices:
+                            continue
+                        piece = chunk.choices[0].delta.content
+                        if piece:
+                            yield piece
+                    return
+                except groq.RateLimitError as e:
+                    wait = _retry_after(e)
+                    soonest = min(soonest, wait)
+                    # FIX: a short "try again in a couple seconds" limit used to jump straight to
+                    # the next model/key (burning into ITS quota too); now it waits and retries
+                    # the same model+key first, same as the non-streaming helper already did.
+                    if wait <= MAX_SHORT_WAIT and attempt < 2:
+                        time_sleep(wait + 0.5)
                         continue
-                    piece = chunk.choices[0].delta.content
-                    if piece:
-                        yield piece
-                return
-            except groq.RateLimitError as e:
-                wait = _retry_after(e)
-                soonest = min(soonest, wait)
-                # FIX: a short "try again in a couple seconds" limit used to jump straight to
-                # the next model (burning into ITS quota too); now it waits and retries the
-                # same model first, same as the non-streaming helper already did.
-                if wait <= MAX_SHORT_WAIT and attempt < 2:
-                    time_sleep(wait + 0.5)
-                    continue
-                break                                     # long wait -> next model
-            except groq.APIStatusError as e:
-                if e.status_code in (413, 500, 502, 503):  # too large / server busy -> next model
-                    break
-                break                                       # any other status -> next model too
+                    break                                     # long wait -> next key, then model
+                except groq.APIStatusError as e:
+                    if e.status_code in (413, 500, 502, 503):  # too large / server busy -> next
+                        break
+                    break                                       # any other status -> next too
 
-    if OPENROUTER_API_KEY:
-        for candidate in OPENROUTER_MODELS:
-            text = _call_openrouter(msgs, candidate, temp)
+    for candidate in OPENROUTER_MODELS:
+        for okey in OPENROUTER_API_KEYS:
+            text = _call_openrouter(msgs, candidate, temp, okey)
             if text:
                 yield text
                 return
@@ -3664,8 +4073,10 @@ if prompt or (regen and messages and messages[-1]["role"] == "user"):
     current_prompt = prompt if prompt else messages[-1]["content"]
     chat_name = st.session_state.current_chat
     has_deck = chat_name in st.session_state.deck_specs
+    has_doc = chat_name in st.session_state.doc_specs
     edit_target = detect_edit(current_prompt, has_deck) if prompt else None
     intent = detect_intent(current_prompt) if (prompt and not edit_target) else None
+    doc_edit = detect_doc_edit(current_prompt, has_doc) if (prompt and not edit_target and not intent) else False
 
     if intent == "image":
         img_subject = extract_image_prompt(current_prompt)
@@ -3735,19 +4146,88 @@ if prompt or (regen and messages and messages[-1]["role"] == "user"):
         with st.chat_message("assistant"):
             with st.spinner("📄 Writing your document..."):
                 try:
-                    content = generate_doc_content(current_prompt)
-                    doc_bytes = markdown_to_docx(content, current_prompt[:80])
+                    font_name, step1 = extract_and_strip_font(current_prompt)
+                    sizes, step2 = extract_and_strip_size(step1)
+                    custom_name, clean_topic = extract_and_strip_filename(step2)
+                    content = generate_doc_content(clean_topic)
+                    doc_bytes = markdown_to_docx(
+                        content, clean_topic[:80], font_name=font_name,
+                        title_size=sizes["title"], heading_size=sizes["heading"], body_size=sizes["body"],
+                    )
+                    notes = []
+                    if font_name:
+                        notes.append(font_name)
+                    if sizes["body"]:
+                        notes.append(f"{sizes['body']}pt body")
+                    if sizes["heading"]:
+                        notes.append(f"{sizes['heading']}pt headings")
+                    if sizes["title"]:
+                        notes.append(f"{sizes['title']}pt title")
+                    note_str = f" ({', '.join(notes)})" if notes else ""
+                    file_stem = safe_filename(custom_name) if custom_name else safe_filename(clean_topic[:60] or "document")
+                    st.session_state.doc_specs[chat_name] = {
+                        "content": content, "topic": clean_topic, "font_name": font_name,
+                        "sizes": sizes, "filename": file_stem,
+                    }
                     messages.append({
                         "role": "assistant",
-                        "content": f"📄 Generated a Word document for: *{current_prompt}*",
+                        "content": f"📄 Generated a Word document{note_str} for: *{clean_topic}*",
                         "file": {
-                            "name": "document.docx",
+                            "name": f"{file_stem}.docx",
                             "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                             "data": base64.b64encode(doc_bytes).decode(),
                         },
                     })
                 except Exception as e:
                     messages.append({"role": "assistant", "content": f"⚠️ Document generation failed: {e}"})
+        save_history()
+        st.rerun()
+
+    elif doc_edit:
+        with st.chat_message("assistant"):
+            with st.spinner("📄 Updating your document..."):
+                try:
+                    old_spec = st.session_state.doc_specs[chat_name]
+                    # only OVERRIDE what's actually mentioned this turn - anything not
+                    # mentioned keeps the value from the last generation
+                    new_font, step1 = extract_and_strip_font(current_prompt)
+                    new_sizes, step2 = extract_and_strip_size(step1)
+                    new_name, _ = extract_and_strip_filename(step2)
+                    font_name = new_font or old_spec.get("font_name")
+                    sizes = {
+                        k: (new_sizes.get(k) or old_spec.get("sizes", {}).get(k))
+                        for k in ("title", "heading", "body")
+                    }
+                    file_stem = safe_filename(new_name) if new_name else old_spec.get("filename", "document")
+                    doc_bytes = markdown_to_docx(
+                        old_spec["content"], old_spec["topic"][:80], font_name=font_name,
+                        title_size=sizes["title"], heading_size=sizes["heading"], body_size=sizes["body"],
+                    )
+                    notes = []
+                    if font_name:
+                        notes.append(font_name)
+                    if sizes["body"]:
+                        notes.append(f"{sizes['body']}pt body")
+                    if sizes["heading"]:
+                        notes.append(f"{sizes['heading']}pt headings")
+                    if sizes["title"]:
+                        notes.append(f"{sizes['title']}pt title")
+                    note_str = f" ({', '.join(notes)})" if notes else ""
+                    st.session_state.doc_specs[chat_name] = {
+                        "content": old_spec["content"], "topic": old_spec["topic"], "font_name": font_name,
+                        "sizes": sizes, "filename": file_stem,
+                    }
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"📄 Updated the document{note_str}.",
+                        "file": {
+                            "name": f"{file_stem}.docx",
+                            "mime": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            "data": base64.b64encode(doc_bytes).decode(),
+                        },
+                    })
+                except Exception as e:
+                    messages.append({"role": "assistant", "content": f"⚠️ Document update failed: {e}"})
         save_history()
         st.rerun()
 
