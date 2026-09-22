@@ -345,6 +345,17 @@ def theme_css(theme: str) -> str:
     .block-container {{
         padding-bottom: 150px !important;
     }}
+    /* FIX (typed text invisible in light mode): Streamlit's own form/input
+       styling has some dark-themed backgrounds baked in that weren't being
+       overridden (no !important, so they won by specificity), leaving dark
+       text on a dark box even while the rest of the app was in light mode.
+       Reset every background inside the composer first, then explicitly
+       re-apply only the ones we want, and force text/caret colour on the
+       textarea (and its baseweb wrapper) so what you type is always
+       readable in BOTH themes. */
+    .st-key-chat_composer, .st-key-chat_composer * {{
+        background-color: transparent !important;
+    }}
     .st-key-chat_composer {{
         position: fixed !important;
         bottom: 0 !important;
@@ -357,13 +368,18 @@ def theme_css(theme: str) -> str:
         margin: 0 !important;
     }}
     .st-key-chat_composer div[data-testid="stForm"] {{
-        border:1px solid {border}; border-radius:16px; background:{input_bg};
+        border:1px solid {border} !important; border-radius:16px; background:{input_bg} !important;
         padding:8px 10px;
         box-shadow: 0 -6px 18px rgba(0,0,0,0.28);
     }}
+    .st-key-chat_composer div[data-baseweb="textarea"],
+    .st-key-chat_composer div[data-baseweb="base-input"] {{
+        background:{input_bg} !important;
+    }}
     .st-key-chat_composer textarea {{
-        background:transparent !important; color:{text} !important; caret-color:{text} !important;
+        background:{input_bg} !important; color:{text} !important; caret-color:{text} !important;
         border:none !important; box-shadow:none !important;
+        -webkit-text-fill-color:{text} !important;
     }}
     .st-key-chat_composer textarea::placeholder {{ color:{sub} !important; opacity:1 !important; }}
     .st-key-chat_composer button[type="submit"],
