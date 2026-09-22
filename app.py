@@ -2604,7 +2604,7 @@ def build_pptx(spec: dict, include_notes: bool = True) -> bytes:
 
         # ---------- PROCESS / SMARTART PIPELINE LAYOUT ----------
         if layout == "process" and s.get("steps"):
-            steps = s.get("steps", [])[:5]
+            steps = [st_ if isinstance(st_, dict) else {"label": str(st_)} for st_ in s.get("steps", [])][:5]
             n = len(steps)
             gap_in, total_w = 0.42, 11.7
             box_w = (total_w - gap_in * (n - 1)) / n
@@ -2708,7 +2708,7 @@ def build_pptx(spec: dict, include_notes: bool = True) -> bytes:
 
         # ---------- TIMELINE / SMARTART ROADMAP LAYOUT ----------
         if layout == "timeline" and s.get("milestones"):
-            miles = s.get("milestones", [])[:5]
+            miles = [m if isinstance(m, dict) else {"label": str(m)} for m in s.get("milestones", [])][:5]
             n = len(miles)
             total_w = 11.4
             x0 = (13.333 - total_w) / 2
@@ -2754,7 +2754,10 @@ def build_pptx(spec: dict, include_notes: bool = True) -> bytes:
         # ---------- TABLE LAYOUT ----------
         if layout == "table" and s.get("table_headers") and s.get("table_rows"):
             headers = [str(h)[:24] for h in s["table_headers"][:6]]
-            rows = [[str(c)[:40] for c in r[:len(headers)]] for r in s["table_rows"][:8]]
+            rows = [
+                [str(c)[:40] for c in (r[:len(headers)] if isinstance(r, list) else [r])]
+                for r in s["table_rows"][:8]
+            ]
             n_rows, n_cols = len(rows) + 1, len(headers)
             tbl_x, tbl_y = 0.85, 1.75
             tbl_w, tbl_h = 11.6, min(0.55 * n_rows + 0.2, 5.2)
