@@ -275,8 +275,6 @@ def theme_css(theme: str) -> str:
     .stButton>button[kind="primary"], .stButton>button[kind="primary"] * {{ color:#ffffff !important; }}
     div[data-baseweb="input"] input, div[data-baseweb="textarea"] textarea,
     div[data-baseweb="select"] * {{ color:{text} !important; }}
-    div[data-testid="stChatInput"] textarea {{ color:{text} !important; }}
-    div[data-testid="stChatInput"] textarea::placeholder {{ color:{sub} !important; opacity:1; }}
 
     /* The purple user bubble always stays white-on-gradient by design */
     .user, .user * {{ color:#ffffff !important; }}
@@ -294,6 +292,90 @@ def theme_css(theme: str) -> str:
         background:{input_bg} !important; color:{text} !important; caret-color:{text} !important;
     }}
     div[data-testid="stChatInput"] textarea::placeholder {{ color:{sub} !important; opacity:1 !important; }}
+
+    /* ---- Chat input send (arrow) button ----
+       Some Streamlit versions render the message box as a contenteditable
+       div instead of a <textarea> — style both so text is never invisible. */
+    div[data-testid="stChatInput"] [contenteditable="true"],
+    div[data-testid="stChatInput"] div[role="textbox"] {{
+        background:{input_bg} !important; color:{text} !important; caret-color:{text} !important;
+    }}
+    div[data-testid="stChatInput"] {{
+        display:flex !important; align-items:flex-end !important;
+    }}
+    div[data-testid="stChatInput"] button,
+    button[data-testid="stChatInputSubmitButton"],
+    button[data-testid="baseButton-secondary"][kind="icon"] {{
+        background:{accent} !important; border:none !important; border-radius:50% !important;
+        opacity:1 !important; pointer-events:auto !important; visibility:visible !important;
+        color:#ffffff !important;
+        /* FIX (mobile send arrow not responding to tap): make sure the button always sits
+           above the textarea/its own container and that taps register instantly instead of
+           waiting for a "ghost click"/being swallowed by the element underneath. */
+        position:relative !important; z-index:20 !important;
+        touch-action:manipulation !important;
+        -webkit-tap-highlight-color:transparent !important;
+    }}
+    div[data-testid="stChatInput"] button svg,
+    button[data-testid="stChatInputSubmitButton"] svg {{
+        fill:#ffffff !important; color:#ffffff !important; opacity:1 !important;
+    }}
+    div[data-testid="stChatInput"] button:disabled,
+    button[data-testid="stChatInputSubmitButton"]:disabled {{
+        background:{border} !important; opacity:1 !important;
+    }}
+    div[data-testid="stChatInput"] button:disabled svg,
+    button[data-testid="stChatInputSubmitButton"]:disabled svg {{
+        fill:{sub} !important; color:{sub} !important;
+    }}
+    div[data-testid="stChatInput"] button:not(:disabled):hover {{
+        filter:brightness(1.1);
+    }}
+
+    /* ---- New message composer (st.form + real button, replacing the
+       unreliable native chat_input arrow) ----
+       FIX (bar was floating up near the content instead of staying at the
+       very bottom of the screen): "sticky" only pins once there's enough
+       content to scroll past it, so on a short/empty chat it just sat where
+       the content ended. It's now genuinely fixed to the bottom of the
+       viewport (like ChatGPT / Streamlit's own chat_input) - see the
+       companion JS in inject_composer_fix() which keeps its left edge/width
+       aligned with the main content column (so it never overlaps the
+       sidebar) and updates live if the sidebar is opened/closed/resized. */
+    .block-container {{
+        padding-bottom: 150px !important;
+    }}
+    .st-key-chat_composer {{
+        position: fixed !important;
+        bottom: 0 !important;
+        left: 0;
+        right: 0;
+        z-index: 999 !important;
+        background: {bg} !important;
+        padding: 10px 24px 16px 24px !important;
+        box-sizing: border-box !important;
+        margin: 0 !important;
+    }}
+    .st-key-chat_composer div[data-testid="stForm"] {{
+        border:1px solid {border}; border-radius:16px; background:{input_bg};
+        padding:8px 10px;
+        box-shadow: 0 -6px 18px rgba(0,0,0,0.28);
+    }}
+    .st-key-chat_composer textarea {{
+        background:transparent !important; color:{text} !important; caret-color:{text} !important;
+        border:none !important; box-shadow:none !important;
+    }}
+    .st-key-chat_composer textarea::placeholder {{ color:{sub} !important; opacity:1 !important; }}
+    .st-key-chat_composer button[type="submit"],
+    .st-key-chat_composer .stButton>button,
+    .st-key-chat_composer button {{
+        background:linear-gradient(135deg,{accent},{accent2}) !important;
+        border:none !important; border-radius:50% !important; color:#ffffff !important;
+        width:44px !important; height:44px !important; min-height:44px !important;
+        font-size:18px !important; line-height:1 !important;
+        touch-action:manipulation !important; -webkit-tap-highlight-color:transparent !important;
+    }}
+    .st-key-chat_composer button:hover {{ filter:brightness(1.1); }}
 
     /* selectbox / multiselect closed control */
     div[data-baseweb="select"] > div {{
@@ -2526,6 +2608,70 @@ def copy_button(text: str, label: str = "📋 Copy", height: int = 42):
     )
 
 
+# ---------------------------------------------------------------------------
+# 1) Lets the Enter key (like a normal chat app) send the message by clicking
+#    the real send button for us - a genuine, trusted click on an ordinary
+#    Streamlit button, so it's exactly as reliable as clicking/tapping it by
+#    hand. Shift+Enter still inserts a new line, same as most chat apps.
+# 2) Keeps the fixed composer's left edge and width matched to the main
+#    content column (not the full browser window), so it lines up under the
+#    chat area and never overlaps the sidebar - and re-measures on resize /
+#    sidebar open-close so it's always correct, exactly like a native
+#    ChatGPT-style bottom bar.
+# ---------------------------------------------------------------------------
+def inject_composer_fix():
+    components.html(
+        """
+<script>
+(function () {
+  function patchEnterKey(doc, box) {
+    var ta = box.querySelector('textarea');
+    var btn = box.querySelector('button');
+    if (!ta || !btn || ta.dataset.omnixShortcut) return;
+    ta.dataset.omnixShortcut = '1';
+    ta.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        btn.click();
+      }
+    });
+  }
+
+  function alignToMainColumn(doc, box) {
+    var main = doc.querySelector('section[data-testid="stMain"]')
+      || doc.querySelector('[data-testid="stAppViewContainer"] section.main')
+      || doc.querySelector('section.main')
+      || doc.querySelector('.main');
+    if (!main) return;
+    var rect = main.getBoundingClientRect();
+    box.style.left = rect.left + 'px';
+    box.style.width = rect.width + 'px';
+    box.style.right = 'auto';
+  }
+
+  function patch() {
+    try {
+      var doc = window.parent.document;
+      var box = doc.querySelector('.st-key-chat_composer');
+      if (!box) return;
+      patchEnterKey(doc, box);
+      alignToMainColumn(doc, box);
+    } catch (e) {
+      /* parent DOM not ready yet - ignore and retry */
+    }
+  }
+  patch();
+  setInterval(patch, 500);
+  try {
+    window.parent.addEventListener('resize', patch);
+  } catch (e) {}
+})();
+</script>
+""",
+        height=0,
+    )
+
+
 tcol1, tcol2 = st.sidebar.columns([3, 2])
 with tcol1:
     st.markdown("**🌀 Omnix.ai**")
@@ -2534,6 +2680,7 @@ with tcol2:
     st.session_state.theme = "dark" if dark_on else "light"
 
 st.markdown(theme_css(st.session_state.theme), unsafe_allow_html=True)
+inject_composer_fix()
 
 st.markdown(
     """
@@ -3004,10 +3151,33 @@ with st.expander("🎙️ Voice typing — speak instead of typing"):
                 st.session_state.queued = text.strip()
                 st.rerun()
 
-user_input = st.chat_input(
-    "Ask anything... or try “create an image of...”, “make a ppt about...”, "
-    "“write a report on...”"
-)
+# ---------------------------------------------------------------------------
+# FIX (send arrow not clickable): st.chat_input's own built-in arrow button is a
+# Streamlit-internal control that can fail to register taps on some phones/
+# browsers. A regular st.form_submit_button is an ordinary Streamlit button —
+# the same kind used everywhere else in this app (New chat, Generate image,
+# etc.) — and always responds to a click/tap. Swapping to it makes the arrow
+# reliably clickable on every device. It's pinned to the bottom of the screen
+# (see .st-key-chat_composer in theme_css) like a normal chat bar, and Enter
+# sends the message (Shift+Enter for a new line) via inject_composer_fix().
+# ---------------------------------------------------------------------------
+composer = st.container(key="chat_composer")
+with composer:
+    with st.form("chat_form", clear_on_submit=True):
+        ic1, ic2 = st.columns([10, 1], vertical_alignment="bottom")
+        with ic1:
+            typed = st.text_area(
+                "Message",
+                key="chat_text_input",
+                label_visibility="collapsed",
+                placeholder="Ask anything... or try “create an image of...”, “make a ppt about...”, "
+                            "“write a report on...”  (Enter to send, Shift+Enter for new line)",
+                height=68,
+            )
+        with ic2:
+            sent = st.form_submit_button("➤", type="primary", use_container_width=True)
+
+user_input = typed.strip() if (sent and typed and typed.strip()) else None
 prompt = user_input or queued
 
 if prompt or (regen and messages and messages[-1]["role"] == "user"):
