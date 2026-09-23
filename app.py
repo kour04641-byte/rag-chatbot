@@ -3438,14 +3438,105 @@ def save_edit(idx):
 
 
 def google_search(query):
+    # FIX ("I want it to know everything with 100% correct info"): the old version returned
+    # bare snippets with no source name, so the model had nothing to distinguish "confirmed by
+    # a real source" from "sounds right." Each result now carries its title/source, and there
+    # are more of them (8 instead of 5), so specific facts about lesser-known,
+    # niche real-world entities (a small university, a local business, etc.) - exactly where a
+    # model's built-in memory is thinnest and most likely to confidently invent plausible-
+    # sounding specifics - have an actual source attached instead of nothing at all.
     try:
         url = "https://google.serper.dev/search"
         headers = {"X-API-KEY": SERPER_API_KEY, "Content-Type": "application/json"}
         res = requests.post(url, headers=headers, json={"q": query}, timeout=10)
         data = res.json()
-        return " ".join(i.get("snippet", "") for i in data.get("organic", [])[:5])
+        parts = []
+        kg = data.get("knowledgeGraph")
+        if kg and kg.get("description"):
+            kg_link = kg.get("website") or kg.get("descriptionLink") or ""
+            parts.append(f"[{kg.get('title', 'Overview')}]({kg_link}) {kg['description']}")
+        for i in data.get("organic", [])[:8]:
+            if i.get("snippet"):
+                # FIX (fake/unclickable links and invented phone numbers): this used to return
+                # only title+snippet with NO url, so the model literally never received a real
+                # link - it had to guess what a plausible-looking URL (or, by the same bad
+                # pattern-matching, a plausible-looking Indian phone number) would look like,
+                # which is exactly how invented links and numbers like "91922xxxxxx" happen.
+                # Every result now carries its real, clickable URL so the model can cite the
+                # actual source instead of inventing one.
+                link = i.get("link", "")
+                parts.append(f"[{i.get('title', 'source')}]({link}) {i['snippet']}")
+        return "\n".join(parts)
     except Exception:
         return ""
+
+
+# FIX ("asked about Akal University, it said it's in Satna, MP - which is false": the app told
+# the user to manually flip on "Use web search" for anything it needed to get right, but the
+# 🌐 checkbox defaults OFF and nothing about a plain factual question ("where is X",
+# "tell me about X university") signals to a first-time user that THIS particular question is
+# the kind where the model's own memory can't be trusted. So the model answered a basic,
+# checkable identity fact - which real-world entity is located in which real-world place -
+# straight from its own (thin, for a smaller institution) memory, invented a specific but
+# wrong state, and stated it with total confidence. Asking the user to remember to flip a
+# switch every time is exactly the "chance for the user to be disappointed" they don't want.
+# Instead, detect the shape of a real-world-entity factual question and turn web grounding ON
+# for that turn automatically, regardless of the checkbox - the checkbox still exists for
+# forcing search on for anything else, but accuracy-critical questions no longer depend on the
+# user remembering to ask for it.
+_FACTUAL_ENTITY_RE = re.compile(
+    r"\b(university|college|institute|polytechnic|school|academy|hospital|company|corporation|"
+    r"organi[sz]ation|foundation|airport|stadium|museum|temple|church|mosque|gurudwara|gurdwara|"
+    r"headquarters|ceo|founder|capital of|population of)\b",
+    re.I,
+)
+_FACTUAL_QUESTION_RE = re.compile(
+    r"\bwhere is\b|\blocated\b|\blocation of\b|\bwhich (state|city|country|district)\b|"
+    r"\bwho is\b|\bwho founded\b|\bwho (owns|runs)\b|\bwhen was\b|"
+    r"\bfounded in\b|\bestablished in\b|\bofficial website\b|\bhow far is\b|\baddress of\b|"
+    r"\btell me about\b|\bwhat is\b|\bgenuine\b|\blegit\b|\bscam\b|\breal or fake\b",
+    re.I,
+)
+# FIX ("asked about NAAC grade, it said it doesn't know" / links and phone numbers being
+# invented): the AND-of-two-regexes check above only catches a narrow shape of question
+# ("where is X university"). A perfectly ordinary checkable-fact question like "what's the
+# NAAC grade of X college", "contact number of Y hospital", or "fees at Z institute" matched
+# NEITHER regex, so web grounding silently stayed off and the model was left to either guess
+# (inventing a link/phone number) or, correctly per its own instructions, refuse outright -
+# neither of which is what you want. This adds a standalone list of "checkable attribute"
+# keywords - accreditation/ranking/contact/financial/admission details are exactly the kind of
+# specific, verifiable facts about a real institution that should never be answered from
+# memory alone - so ANY of these alone is enough to turn web search on, no entity word or
+# question-shape required.
+_FACTUAL_ATTRIBUTE_RE = re.compile(
+    r"\b(naac|nirf|nba|ugc|aicte|accredit\w*|affiliat\w*|recogni[sz]ed by|"
+    r"grade|grading|rating|ranking|rank(ed)?|"
+    r"contact( no| number)?|phone( no| number)?|mobile( no| number)?|helpline|"
+    r"email( id| address)?|website|whatsapp|"
+    r"fee(s)?|fee structure|tuition|admission\w*|cutoff|eligibility|"
+    r"placement\w*|package\w*|courses? offered|"
+    r"principal|director|chancellor|vice[- ]chancellor|dean|registrar|"
+    r"pincode|pin code|postal code|address\b|"
+    r"reviews?|ratings?|complaints?|"
+    r"latest|current(ly)?|this year|as of \d{4}|in 20\d\d)\b",
+    re.I,
+)
+
+
+def looks_like_factual_query(text: str) -> bool:
+    """A real-world-entity factual question ('where is X university', 'NAAC grade of Y college',
+    'contact number of Z hospital') - exactly the case where the model's own memory is least
+    reliable and most likely to confidently invent a wrong specific, a dead link, or a fake
+    phone number. These should get web grounding automatically, without the user needing to
+    remember to flip the checkbox."""
+    if not text:
+        return False
+    if _FACTUAL_ATTRIBUTE_RE.search(text):
+        return True
+    return bool(_FACTUAL_ENTITY_RE.search(text)) and bool(_FACTUAL_QUESTION_RE.search(text))
+
+
+
 
 
 def copy_button(text: str, label: str = "📋 Copy", height: int = 42):
@@ -3740,8 +3831,13 @@ with st.sidebar.expander("⚙️ Settings"):
     style = st.radio("Answer style", list(STYLES), index=list(STYLES).index("Outstanding"))
     use_web = st.checkbox(
         "🌐 Use web search", value=False,
-        help="Adds search snippets to every request, which uses extra tokens against "
-             "your daily free-tier limit. Leave off unless you need current info.",
+        help="Adds real, sourced search results to every request, which uses extra tokens "
+             "against your daily free-tier limit. The app already auto-turns this on by itself "
+             "for questions that look like checkable real-world facts (e.g. 'where is X "
+             "university located'), so you mainly need this switch for other cases where you "
+             "want a specific answer backed by a live source - a person, statistic, or anything "
+             "else the AI might not have reliable memorized info on. Leave off for general "
+             "questions.",
     )
     st.checkbox(
         "🔊 Speak AI replies aloud", key="speak_replies",
@@ -4109,6 +4205,55 @@ def build_system_prompt(history, kb, web_on, style_name):
         "document, notes, a plan), hold it to a careful expert's bar, not a quick first draft. "
         "If there's an important catch, edge case, or better approach the user didn't ask "
         "about but would clearly want to know, mention it briefly rather than staying silent.\n"
+        # FIX ("I want my model to know about everything with 100% correct info" - flagged a
+        # reply about a lesser-known university that invented precise-sounding specifics: an
+        # exact acreage figure, a library book count, distances to nearby cities, a named Act
+        # of legislature - none of it verifiable, presented as confident fact): a model's
+        # built-in memory is thinnest for smaller/niche real-world entities (a specific
+        # university, a local business, a small organization) - exactly where it's most tempted
+        # to pattern-match "what facts of this type usually look like" and state an invented
+        # number with total confidence instead of admitting it doesn't actually know. No model,
+        # this one included, truly has 100% accurate info on every real-world entity that
+        # exists - so the honest fix is refusing to manufacture false confidence rather than
+        # promising an impossible guarantee.
+        "FACTUAL ACCURACY - DO NOT INVENT SPECIFICS: when asked about a real, specific, "
+        "checkable fact about a real-world entity (a particular institution/university/school, "
+        "company, organization, person, place, law, or statistic) - especially a smaller or "
+        "less internationally famous one you don't have strong, reliable, well-established "
+        "knowledge of - do NOT invent precise-sounding specifics. This includes not just numbers "
+        "(an exact founding year or founding act/law, acreage, enrollment, book counts, rankings, "
+        "distances) but also basic identity facts that feel simple but are just as easy to get "
+        "wrong: which city/state/country something is actually located in, who leads or owns it, "
+        "what it's affiliated with, etc. Getting the STATE or CITY wrong is exactly as bad as "
+        "getting a number wrong - it is not a 'safe' fact just because it isn't a number. If "
+        "'Web search results' are provided below and cover it, use and cite those over your own "
+        "memory even if your own memory feels confident - a source in hand beats a guess, however "
+        "fluent the guess sounds. If they don't cover it (or web search wasn't used for this "
+        "reply), give only what you're genuinely confident is accurate, clearly separate any "
+        "general/typical-for-this-category context from confirmed fact (e.g. 'I'm not fully "
+        "certain of the exact figures/location'), and say plainly that for precise, up-to-date, "
+        "guaranteed-accurate details the user should turn on 🌐 Web search in Settings (for this "
+        "exact question) or check the entity's own official website - rather than stating "
+        "unverified specifics as if they were confirmed fact. This applies however confident the "
+        "phrasing would otherwise sound - fluent, detailed prose is not the same thing as "
+        "accurate prose.\n"
+        # FIX (fake un-clickable links, invented phone numbers like "91922xxxxxx"): a URL,
+        # phone number, or email address is not "probably fine to reconstruct from the usual
+        # pattern" the way prose is - a single wrong digit or path makes it completely useless
+        # or actively misleading, so this gets a hard, separate rule on top of the general
+        # accuracy rule above.
+        "LINKS, PHONE NUMBERS & CONTACT DETAILS - NEVER INVENT THESE: only ever output a URL, "
+        "phone number, email address, or physical address if it appears VERBATIM in the 'Web "
+        "search results' below (each result there is shown as [Title](URL) so you have the "
+        "real link to copy exactly, character-for-character - never shorten, guess, "
+        "autocomplete, 'clean up', or partially-mask a number or link). Format a link you copy "
+        "as a normal markdown link, [Title](https://exact-url-from-results), so it's clickable. "
+        "If NO web search results are available, or none of them contain the specific contact "
+        "detail/link being asked for, do NOT produce one anyway (not even one that 'looks "
+        "right' for that kind of entity) - say plainly that you don't have a verified "
+        "link/number for that and suggest the user turn on 🌐 Web search or check the entity's "
+        "own official website/listing directly. A missing detail stated honestly is always "
+        "better than a fabricated one that won't work when clicked or called.\n"
     ) + FORMAT_RULES
 
     # FIX (speaker notes weaker than ChatGPT): a generic "answer the question" system prompt
@@ -4252,7 +4397,27 @@ ATTACHED-FILE RULES:
 """
 
     if web_data:
-        prompt += f"\nWeb search snippets (may be irrelevant, use only if helpful):\n{web_data}\n"
+        prompt += (
+            f"\nWeb search results (each shown as [Title](URL) followed by its snippet - the "
+            f"URL is REAL and clickable, this is current, checkable info, not your own "
+            f"memory):\n{web_data}\n"
+            "For any fact these results confirm or contradict, prefer THIS over your own "
+            "memory, and you may state it as confirmed fact. If you mention a source, link to "
+            "it using its exact URL from above. Do not describe, cite, or link to a result "
+            "whose snippet doesn't actually contain the specific detail being asked about.\n"
+        )
+    elif web_on:
+        # The checkbox/auto-trigger was on, but Serper returned nothing usable (e.g. API error
+        # or no results) - the model must know grounding was ATTEMPTED but failed, so it
+        # doesn't wrongly assume "no web block shown" means "wasn't asked for" and quietly
+        # answer from memory instead of flagging the gap to the user.
+        prompt += (
+            "\nWeb search was attempted for this reply but returned no usable results (this "
+            "can happen for very obscure queries or a temporary search-service issue). Do not "
+            "invent specifics to fill the gap - tell the user the search didn't return "
+            "anything reliable for this and, where relevant, suggest checking the entity's own "
+            "official website directly.\n"
+        )
     return prompt
 
 
@@ -4626,8 +4791,13 @@ if prompt or (regen and messages and messages[-1]["role"] == "user"):
 
     else:
         active_kb = st.session_state.docs.get(st.session_state.current_chat)
+        # FIX (Akal University answered from ungrounded memory, stated wrong state as fact):
+        # don't rely solely on the user remembering to flip the checkbox - auto-force web
+        # grounding on for this turn when the question itself looks like a checkable
+        # real-world-entity fact, regardless of what the checkbox says.
+        effective_web = use_web or looks_like_factual_query(current_prompt)
         cache_key = response_cache_key(
-            st.session_state.current_chat, active_kb, current_prompt, model, temperature, style, use_web
+            st.session_state.current_chat, active_kb, current_prompt, model, temperature, style, effective_web
         )
         cached = st.session_state.response_cache.get(cache_key)
 
@@ -4640,7 +4810,7 @@ if prompt or (regen and messages and messages[-1]["role"] == "user"):
             else:
                 placeholder.markdown("⏳ Thinking...")
                 try:
-                    for piece in stream_response(messages, active_kb, use_web, model, temperature, style):
+                    for piece in stream_response(messages, active_kb, effective_web, model, temperature, style):
                         acc += piece
                         placeholder.markdown(normalize_math(acc) + " ▌")
                 except Exception as e:
