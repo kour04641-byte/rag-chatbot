@@ -3059,6 +3059,14 @@ st.session_state.setdefault("speak_replies", False)   # opt-in autoplay toggle, 
 st.session_state.setdefault("spoken_marks", set())     # (chat, msg_index) already auto-spoken
 st.session_state.setdefault("speak_now_idx", None)      # set by a per-message "🔊 Play" click
 st.session_state.setdefault("voice_conversation_mode", False)  # hands-free talk <-> listen loop
+# FIX ("no option to stop, no option to continue from where it was stopped"): Play only ever
+# started a fresh reading from the top with no way to pause/resume or stop it mid-sentence.
+# speechSynthesis.pause()/.resume() are real browser features that suspend and continue the
+# SAME utterance mid-word - so "Pause" then "Resume" genuinely continues from where it left
+# off, not a restart. Only one pending control action is tracked at a time (global, not
+# per-message) because the browser only ever has ONE speech queue regardless of which message
+# started it.
+st.session_state.setdefault("speech_pending_action", None)   # "toggle_pause" | "stop" | None
 
 
 def select_chat(name):
@@ -3294,6 +3302,35 @@ def _tts_component(text: str, comp_key: str):
 
 def request_speak(idx):
     st.session_state.speak_now_idx = idx
+
+
+def request_pause_resume():
+    st.session_state.speech_pending_action = "toggle_pause"
+
+
+def request_stop_speech():
+    st.session_state.speech_pending_action = "stop"
+
+
+def _speech_control_component(action: str):
+    """Fires a one-off control against the SAME persistent browser speech queue that
+    _tts_component() speaks into (window.parent.speechSynthesis) - so Pause/Resume/Stop always
+    act on whatever is actually playing, no matter which message's Play button started it.
+    "toggle_pause" checks the browser's OWN live state each time (not anything Streamlit
+    tracks) and does the opposite of whatever it's currently doing: pause() if it's speaking,
+    resume() if it's paused - so one button correctly alternates without the server needing to
+    know which state it's in."""
+    js = {
+        "toggle_pause": (
+            "var s = window.parent.speechSynthesis;"
+            "if (s.speaking && !s.paused) { s.pause(); }"
+            "else if (s.paused) { s.resume(); }"
+        ),
+        "stop": "window.parent.speechSynthesis.cancel();",
+    }.get(action, "")
+    if not js:
+        return
+    components.html(f"<script>try {{ {js} }} catch (e) {{}}</script>", height=0)
 
 
 def _conversation_listen_component():
@@ -3933,7 +3970,7 @@ def render_message(msg: dict, key_prefix="m"):
 
 
 def message_toolbar(idx, msg, is_last):
-    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
+    c1, c2, c3, c4, c5, c6, c7 = st.columns([2, 2, 2, 1.5, 1.7, 1.5, 2])
     with c1:
         copy_button(msg.get("content", ""), "📋 Copy reply")
     with c2:
@@ -3953,8 +3990,12 @@ def message_toolbar(idx, msg, is_last):
             st.rerun()
     with c4:
         st.button("🔊 Play", key=f"speak_{idx}", on_click=request_speak, args=(idx,))
+    with c5:
+        st.button("⏯️ Pause/Resume", key=f"pause_{idx}", on_click=request_pause_resume)
+    with c6:
+        st.button("⏹️ Stop", key=f"stop_{idx}", on_click=request_stop_speech)
     if is_last:
-        with c5:
+        with c7:
             st.button("🔄 Regenerate", key=f"regen_{idx}", on_click=request_regen)
 
 
@@ -4338,6 +4379,12 @@ for i, msg in enumerate(messages):
 if messages and messages[-1]["role"] == "user" and not regen:
     st.warning("The last message has no reply yet.")
     st.button("🔄 Retry", on_click=request_regen)
+
+# Fires a pending ⏯️ Pause/Resume or ⏹️ Stop click (global - only one speech queue exists in the
+# browser regardless of which message's Play button started it) exactly once, then clears it.
+if st.session_state.speech_pending_action:
+    _speech_control_component(st.session_state.speech_pending_action)
+    st.session_state.speech_pending_action = None
 
 # FIX ("have us a conversation - it should listen to my voice and respond in its own voice"):
 # the other half of voice conversation mode. Placed after everything else so it only ever runs
