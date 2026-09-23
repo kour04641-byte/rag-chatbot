@@ -3304,8 +3304,12 @@ def request_speak(idx):
     st.session_state.speak_now_idx = idx
 
 
-def request_pause_resume():
-    st.session_state.speech_pending_action = "toggle_pause"
+def request_pause():
+    st.session_state.speech_pending_action = "pause"
+
+
+def request_resume():
+    st.session_state.speech_pending_action = "resume"
 
 
 def request_stop_speech():
@@ -3316,16 +3320,12 @@ def _speech_control_component(action: str):
     """Fires a one-off control against the SAME persistent browser speech queue that
     _tts_component() speaks into (window.parent.speechSynthesis) - so Pause/Resume/Stop always
     act on whatever is actually playing, no matter which message's Play button started it.
-    "toggle_pause" checks the browser's OWN live state each time (not anything Streamlit
-    tracks) and does the opposite of whatever it's currently doing: pause() if it's speaking,
-    resume() if it's paused - so one button correctly alternates without the server needing to
-    know which state it's in."""
+    "resume" genuinely continues the paused utterance from the exact word it stopped at
+    (real speechSynthesis.resume(), not a restart) - kept as its own explicit button, separate
+    from "Play from start", because those are two different, deliberately distinct actions."""
     js = {
-        "toggle_pause": (
-            "var s = window.parent.speechSynthesis;"
-            "if (s.speaking && !s.paused) { s.pause(); }"
-            "else if (s.paused) { s.resume(); }"
-        ),
+        "pause": "window.parent.speechSynthesis.pause();",
+        "resume": "window.parent.speechSynthesis.resume();",
         "stop": "window.parent.speechSynthesis.cancel();",
     }.get(action, "")
     if not js:
@@ -3970,7 +3970,7 @@ def render_message(msg: dict, key_prefix="m"):
 
 
 def message_toolbar(idx, msg, is_last):
-    c1, c2, c3, c4, c5, c6, c7 = st.columns([2, 2, 2, 1.5, 1.7, 1.5, 2])
+    c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
     with c1:
         copy_button(msg.get("content", ""), "📋 Copy reply")
     with c2:
@@ -3989,13 +3989,20 @@ def message_toolbar(idx, msg, is_last):
             save_history()
             st.rerun()
     with c4:
-        st.button("🔊 Play", key=f"speak_{idx}", on_click=request_speak, args=(idx,))
-    with c5:
-        st.button("⏯️ Pause/Resume", key=f"pause_{idx}", on_click=request_pause_resume)
-    with c6:
-        st.button("⏹️ Stop", key=f"stop_{idx}", on_click=request_stop_speech)
+        # FIX ("I want an option to continue from where it was stopped, and another to restart
+        # from the start"): four DIFFERENT, clearly separate actions no longer fit as their own
+        # toolbar buttons without truncating on mobile (as seen: "Pause/Res..."), so they're
+        # grouped into one compact "🔊 Speech" popover instead - same four actions, just tucked
+        # away until tapped, with each one's label saying exactly what it does.
+        with st.popover("🔊 Speech", help="Play, pause, resume, or stop this reply being read aloud"):
+            st.button("▶️ Play from start", key=f"speak_{idx}", on_click=request_speak, args=(idx,),
+                       use_container_width=True)
+            st.button("⏸️ Pause", key=f"pause_{idx}", on_click=request_pause, use_container_width=True)
+            st.button("⏵️ Resume from where it stopped", key=f"resume_{idx}", on_click=request_resume,
+                       use_container_width=True)
+            st.button("⏹️ Stop", key=f"stop_{idx}", on_click=request_stop_speech, use_container_width=True)
     if is_last:
-        with c7:
+        with c5:
             st.button("🔄 Regenerate", key=f"regen_{idx}", on_click=request_regen)
 
 
