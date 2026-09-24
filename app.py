@@ -169,16 +169,17 @@ MAX_IMAGE_MB = 6
 MAX_INPUT_CHARS = 9000       # max source text sent to the model for most features
 SLIDES_MAX_INPUT_CHARS = 14000  # slides get a bigger budget since decks need more source depth
 MAX_SHORT_WAIT = 20          # seconds we are willing to sleep on a rate limit before switching model
-# FIX ("I don't want to see this free limit issue at all ... work should not stop"): a real
-# per-minute rate limit almost always clears within a minute or two on its own - the old code
-# gave up and showed the user an error the instant the single soonest-known cooldown exceeded
-# MAX_SHORT_WAIT (20s), which is shorter than most actual per-minute reset windows. This budget
-# is for the LAST-RESORT stage only (every model/key/provider already looked busy once): instead
-# of failing immediately, we keep sleeping in short bursts and re-sweeping every pool (Groq,
-# Cerebras/Gemini/Mistral/NVIDIA, OpenRouter) until either one frees up or this much total time
-# has passed - so a genuinely full outage across every connected free account is the only thing
-# that still surfaces the busy message.
-MAX_FINAL_WAIT = 100
+# FIX ("taking too much time to think ... answer within seconds"): the previous 100-second
+# budget meant a genuinely busy stretch could leave the user staring at "thinking..." for up to
+# a minute and a half, silently, before ever seeing the honest "everything's busy" message -
+# that's not fast by any definition, and is very likely what "taking too much time" was actually
+# describing. A real per-minute rate limit does often clear within a minute, but making the user
+# wait through the FULL clearing window in silence is the wrong trade against "answer within
+# seconds" - cut to 20s (same budget as the short-wait stage) so a true full outage is reported
+# quickly instead of making every user wait out the worst case. The retry logic itself (every
+# pool re-swept, shortest-known cooldown respected) is unchanged - only the ceiling on how long
+# to keep trying silently before being honest with the user is lower.
+MAX_FINAL_WAIT = 20
 MAX_PPTX_IMAGES = 10         # max pictures we transcribe with the vision model for image-only decks
 
 PERSIST_CHATS = False
@@ -1670,7 +1671,7 @@ def chat_complete(messages: list, temperature: float = 0.6, preferred: str = Non
     waited = 0.0
     while waited < MAX_FINAL_WAIT:
         wait_left = soonest if soonest != float("inf") else 5.0
-        nap = min(wait_left, 15.0) + 0.5
+        nap = min(wait_left, 4.0) + 0.3
         time_sleep(nap)
         waited += nap
         for model, gclient in rate_limited:
@@ -5569,7 +5570,7 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
         if wait_left == float("inf"):
             wait_left = 5.0  # nothing specifically known to be cooling - still worth a short
                               # pause and another full sweep rather than giving up right away
-        nap = min(wait_left, 15.0) + 0.5
+        nap = min(wait_left, 4.0) + 0.3
         time_sleep(nap)
         waited += nap
 
