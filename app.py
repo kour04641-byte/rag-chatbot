@@ -169,6 +169,16 @@ MAX_IMAGE_MB = 6
 MAX_INPUT_CHARS = 9000       # max source text sent to the model for most features
 SLIDES_MAX_INPUT_CHARS = 14000  # slides get a bigger budget since decks need more source depth
 MAX_SHORT_WAIT = 20          # seconds we are willing to sleep on a rate limit before switching model
+# FIX ("I don't want to see this free limit issue at all ... work should not stop"): a real
+# per-minute rate limit almost always clears within a minute or two on its own - the old code
+# gave up and showed the user an error the instant the single soonest-known cooldown exceeded
+# MAX_SHORT_WAIT (20s), which is shorter than most actual per-minute reset windows. This budget
+# is for the LAST-RESORT stage only (every model/key/provider already looked busy once): instead
+# of failing immediately, we keep sleeping in short bursts and re-sweeping every pool (Groq,
+# Cerebras/Gemini/Mistral/NVIDIA, OpenRouter) until either one frees up or this much total time
+# has passed - so a genuinely full outage across every connected free account is the only thing
+# that still surfaces the busy message.
+MAX_FINAL_WAIT = 100
 MAX_PPTX_IMAGES = 10         # max pictures we transcribe with the vision model for image-only decks
 
 PERSIST_CHATS = False
@@ -1651,12 +1661,18 @@ def chat_complete(messages: list, temperature: float = 0.6, preferred: str = Non
             text = _call_openrouter(messages, cand, temperature, okey)
             if text:
                 return text
-    # Last resort: every model/key in both pools was rate-limited or busy this round. Wait out
-    # the shortest window actually observed, then give those exact combos one more try - and,
-    # since OpenRouter is a separate quota pool that may have recovered independently, sweep
-    # it fresh too before finally giving up.
-    if rate_limited and soonest != float("inf") and soonest <= MAX_SHORT_WAIT:
-        time_sleep(soonest + 0.5)
+    # Last resort: every model/key in both pools was rate-limited or busy this round. Real
+    # per-minute limits usually clear well within a couple of minutes, so instead of giving up
+    # here, keep sleeping in short bursts and re-sweeping every pool (the rate-limited Groq
+    # combos, the extra providers, and OpenRouter) until one succeeds or MAX_FINAL_WAIT is used
+    # up - a genuinely full outage across every connected free account is the only thing that
+    # still raises the busy error below.
+    waited = 0.0
+    while waited < MAX_FINAL_WAIT:
+        wait_left = soonest if soonest != float("inf") else 5.0
+        nap = min(wait_left, 15.0) + 0.5
+        time_sleep(nap)
+        waited += nap
         for model, gclient in rate_limited:
             try:
                 kw = dict(model=model, temperature=temperature, messages=messages)
@@ -1668,6 +1684,9 @@ def chat_complete(messages: list, temperature: float = 0.6, preferred: str = Non
                 return resp.choices[0].message.content or ""
             except Exception:
                 continue
+        extra_text = _call_extra_providers(messages, temperature, max_tokens or 3000)
+        if extra_text:
+            return extra_text
         for cand in OPENROUTER_MODELS:
             for okey in OPENROUTER_API_KEYS:
                 text = _call_openrouter(messages, cand, temperature, okey)
@@ -5473,7 +5492,8 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
                 if _is_cooling("groq", candidate, gi):
                     continue  # remembered as at its limit - go straight to one that isn't
                 try:
-                    for _round in range(3):  # 2nd/3rd round only if the reply hit the output cap
+                    for _round in range(3):  # extra rounds only if the reply was cut short
+                        before_len = len(partial_pieces)
                         kw = dict(
                             model=candidate, temperature=temp, stream=True,
                             messages=_current_msgs(), max_tokens=_out_cap(candidate, base_max),
@@ -5489,7 +5509,20 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
                             if piece:
                                 partial_pieces.append(piece)
                                 yield piece
-                        if finish != "length":
+                        # FIX ("it stops in between ...no doubt the answer is correct"): some
+                        # streams end cleanly (no exception raised) WITHOUT ever sending a final
+                        # "stop" finish_reason - e.g. a mid-generation cutoff that closes the
+                        # connection gracefully instead of erroring. The old check here
+                        # (`if finish != "length": break`) treated that missing signal exactly
+                        # like a normal, complete answer and stopped for good - which is why a
+                        # reply could quietly end partway with nothing (no error, no retry)
+                        # telling the user or the code it was cut short. Now only an EXPLICIT
+                        # "stop"/"content_filter" is trusted as truly finished; anything else
+                        # (finish_reason missing, or "length") gets one more round to continue -
+                        # unless that round added no new text at all, in which case there's
+                        # genuinely nothing left to get and looping further would just burn quota.
+                        got_new_text = len(partial_pieces) > before_len
+                        if finish in ("stop", "content_filter") or not got_new_text:
                             break
                     state["done"] = True
                     return
@@ -5525,14 +5558,36 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
                 yield text
                 return
 
-    # Last resort: if the shortest cooldown is only seconds away (a per-minute limit), wait it out
-    # once and sweep again before ever telling the user everything is busy.
-    wait_left = _soonest_cooldown()
-    if wait_left <= MAX_SHORT_WAIT:
-        time_sleep(wait_left + 0.5)
+    # Last resort: every pool looked busy on this sweep. Real per-minute limits clear on their
+    # own well within a couple of minutes, so instead of failing here, keep sleeping in short
+    # bursts and re-sweeping EVERY pool (Groq, extra providers, OpenRouter) until one frees up or
+    # MAX_FINAL_WAIT is used up - only a genuinely full outage across every connected free
+    # account still reaches the busy message below.
+    waited = 0.0
+    while waited < MAX_FINAL_WAIT:
+        wait_left = _soonest_cooldown()
+        if wait_left == float("inf"):
+            wait_left = 5.0  # nothing specifically known to be cooling - still worth a short
+                              # pause and another full sweep rather than giving up right away
+        nap = min(wait_left, 15.0) + 0.5
+        time_sleep(nap)
+        waited += nap
+
         yield from _groq_pass()
         if state["done"]:
             return
+        extra_text = _call_extra_providers(_current_msgs(), temp, base_max)
+        if extra_text:
+            partial_pieces.append(extra_text)
+            yield extra_text
+            return
+        for candidate in OPENROUTER_MODELS:
+            for okey in OPENROUTER_API_KEYS:
+                text = _call_openrouter(_current_msgs(), candidate, temp, okey)
+                if text:
+                    partial_pieces.append(text)
+                    yield text
+                    return
 
     if partial_pieces:
         return
