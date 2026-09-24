@@ -1914,11 +1914,24 @@ def apply_font_sizes(doc, title_size=None, heading_size=None, body_size=None):
 
 
 def generate_doc_content(topic: str) -> str:
+    # FIX ("relevant info should be given in all the apis"): document generation used to run
+    # purely off the model's built-in memory, with no live web grounding at all - unlike normal
+    # chat, so a document about anything time-sensitive (a recent product, current stats, a real
+    # organization) could come out stale or generic. Reuses the same fast search path chat uses,
+    # and only runs it when the topic actually looks like it needs current/real-world facts (same
+    # detector as chat), so a purely creative/generic topic isn't slowed down for nothing.
+    web_data = google_search(topic[:200])[:3000] if _needs_web_grounding(topic) else ""
     sys_prompt = (
         "You write clear, well-structured documents. Use '##' for section headings, '-' for bullet points, "
         "and plain paragraphs for explanations. Do not add a top-level title (one is added separately). "
         "Be thorough but well organized."
     )
+    if web_data:
+        sys_prompt += (
+            "\n\nCURRENT WEB SOURCES (real and current - prefer these over your own memory for any "
+            "fact, name, number or date that could be time-sensitive; write everything in your own "
+            "words as normal document prose, not as a list of citations):\n" + web_data
+        )
     return chat_complete(
         [{"role": "system", "content": sys_prompt}, {"role": "user", "content": topic[:MAX_INPUT_CHARS]}],
         temperature=0.6,
@@ -2570,11 +2583,22 @@ def generate_slide_spec(topic: str, n_slides: int, want_visuals: bool = True, ex
         "suggest (chart colour mentions, imagery, tone) compatible with that palette.\n"
         if directives["bg_hex"] else ""
     )
+    # FIX ("relevant info should be given in all the apis"): same gap as document generation -
+    # deck outlines were built purely from the model's memory with no live web grounding, so a
+    # deck about a real, current topic could come out generic/stale. Only searches when the
+    # topic looks like it needs current/real-world facts, so a generic/creative deck request
+    # isn't slowed down for nothing.
+    web_data = google_search(topic[:200])[:3000] if _needs_web_grounding(topic) else ""
+    web_line = (
+        "\n\nCURRENT WEB SOURCES (real and current - prefer these over your own memory for any "
+        "fact, name, number or date that could be time-sensitive; weave them into the slide "
+        "content/bullets/speaker notes in your own words, not as a list of citations):\n" + web_data
+    ) if web_data else ""
     sys_prompt = (
         "You are a senior management consultant and presentation designer creating premium, "
         "information-rich, Canva/McKinsey-quality presentation outlines with varied SmartArt-style "
         f"layouts and real depth of content.\nCreate exactly {n_slides} content slides (not counting "
-        f"the title slide). {visual_instruction}{color_line}\n" + SLIDE_SPEC_SCHEMA
+        f"the title slide). {visual_instruction}{color_line}\n" + SLIDE_SPEC_SCHEMA + web_line
     )
     user_content = topic if not extra_context else f"{extra_context}\n\nRequest: {topic}"
     user_content = user_content[:SLIDES_MAX_INPUT_CHARS]
