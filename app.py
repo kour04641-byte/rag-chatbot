@@ -1496,7 +1496,9 @@ def _call_extra_providers(msgs: list, temp: float, max_tokens: int):
                         p["url"],
                         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                         json={"model": model, "temperature": temp, "messages": msgs, "max_tokens": max_tokens},
-                        timeout=60,
+                        timeout=12,  # FIX: was 60 - one slow/hanging provider could eat almost a
+                                     # full minute by itself, with several more providers/keys still
+                                     # queued behind it and no overall deadline watching any of it.
                     )
                     if r.status_code == 429:
                         try:
@@ -1572,7 +1574,7 @@ def _call_openrouter(msgs: list, model_name: str, temp: float, api_key: str = No
                 "Content-Type": "application/json",
             },
             json={"model": model_name, "temperature": temp, "messages": msgs},
-            timeout=60,
+            timeout=12,  # FIX: was 60 - same reasoning as the extra-providers timeout above.
         )
         if r.status_code == 429:
             return None
@@ -4388,17 +4390,27 @@ def _strip_md(s: str) -> str:
 
 
 def _list_candidate(line: str):
-    """The 'name' part of a list item or a table row's first real cell (None if the line
-    isn't one)."""
+    """The 'name' part of a list item or a table row's first real cell, and any trailing
+    title/role text after it (None, None if the line isn't a list/table row at all).
+    FIX ("gave wrong info" - a real person's real name, but with a fabricated title/role/
+    department stapled onto it, e.g. "**Dr. Joginder Lal Sharma** - Dean"): the previous version
+    threw away everything after the name (the " - Dean" part) BEFORE the accuracy guard ever saw
+    it, so the guard could only ever check "does this name appear somewhere in the sources", never
+    "is this name actually associated with the specific role/department claimed for it here". A
+    model can lift a genuine name from the sources (maybe from an unrelated college, an old page,
+    or just a name it has seen before) and confidently attach an invented title to it, and the old
+    guard had no way to catch that at all - the title text was gone before the check ran. Now the
+    title is kept and returned separately so the caller can verify it too."""
     if line.lstrip().startswith("|"):
         cells = [_strip_md(c) for c in line.strip().strip("|").split("|")]
-        for c in cells:
+        for k, c in enumerate(cells):
             if c and not re.fullmatch(r"[\d.\s]+", c):
-                return c
-        return None
+                rest = " ".join(cc for cc in cells[k + 1:] if cc)
+                return c, (rest or None)
+        return None, None
     m = _LIST_LINE_RE.match(line)
     if not m:
-        return None
+        return None, None
     body = m.group(1).strip()
     b = re.match(r"\*\*(.+?)\*\*", body) or re.match(r"__(.+?)__", body)
     cand = b.group(1) if b else body
@@ -4406,9 +4418,22 @@ def _list_candidate(line: str):
     # a 'Label: value' bullet with a short label ("Location: Baru Sahib") is not a name
     lab = re.match(r"^([^:]{1,40}):\s", cand + " ")
     if lab and len(_guard_tokens(lab.group(1))) <= 3 and ":" in cand:
-        return None
-    cand = re.split(r"\s[-\u2013\u2014]\s|:\s|\s\(|\s\|", cand)[0].strip(" .,;")
-    return cand or None
+        return None, None
+    full = _strip_md(body)
+    parts = re.split(r"(\s[-\u2013\u2014]\s|:\s|\s\(|\s\|)", cand, maxsplit=1)
+    name = parts[0].strip(" .,;")
+    title = None
+    fparts = re.split(r"\s[-\u2013\u2014]\s|:\s|\s\(|\s\|", full, maxsplit=1)
+    if len(fparts) > 1:
+        title = fparts[1].strip(" .,;)")
+    return (name or None), title
+
+
+_ROLE_WORD_RE = re.compile(
+    r"\b(dean|professor|lecturer|associate|assistant|hod|head|director|principal|chancellor|"
+    r"vice[- ]?chancellor|registrar|chairperson|chairman|dean|coordinator|warden|incharge|"
+    r"in[- ]charge)\b", re.I,
+)
 
 
 def _looks_like_name(cand: str) -> bool:
@@ -4438,11 +4463,25 @@ def guard_check_answer(answer: str, evidence: str, remove_unsupported: bool):
             continue
         if in_code or i in header_rows or _SEP_ROW_RE.match(line or ""):
             continue
-        cand = _list_candidate(line)
+        cand, title = _list_candidate(line)
         if not cand or not _looks_like_name(cand):
             continue
         toks = _guard_tokens(cand)
-        if len(toks) < 2 or idx.supports(toks):
+        if len(toks) < 2:
+            continue
+        supported = idx.supports(toks)
+        # FIX (see _list_candidate above): a name that checks out on its own can still be
+        # paired with a fabricated role/department. If the line claims a specific title and
+        # that title contains a real role word, the role's tokens must ALSO show up within the
+        # same evidence span as the name - not just exist somewhere in the sources on their
+        # own (every college's evidence will contain the word "Dean" *somewhere*; that proves
+        # nothing about who holds it). A title with no recognizable role word (e.g. just a
+        # subject area) is left unchecked rather than guessed at.
+        if supported and title and _ROLE_WORD_RE.search(title):
+            title_toks = _guard_tokens(title)
+            if title_toks and not idx.supports(toks + title_toks):
+                supported = False
+        if supported:
             continue
         unsupported.append(cand)
         if remove_unsupported:
@@ -4603,13 +4642,45 @@ def inject_composer_fix():
 (function () {
   function patchEnterKey(doc, box) {
     var ta = box.querySelector('textarea');
-    var btn = box.querySelector('button');
+    // FIX ("typed it, pressed Enter, nothing happens, message disappears, search doesn't run
+    // either"): box.querySelector('button') grabs the FIRST <button> in the composer. Newer
+    // Streamlit text areas render their own small utility button (an expand/fullscreen toggle
+    // in the corner) BEFORE the actual send button in DOM order (the text box is laid out
+    // first, the send button after it) - so Enter was silently clicking that icon instead of
+    // submitting the form. Nothing was ever sent, so of course nothing showed up and nothing
+    // could search. The real send button is always the LAST button in the composer (it's the
+    // last widget added to the form), so select from the end instead of the start.
+    var btns = box.querySelectorAll('button');
+    var btn = btns.length ? btns[btns.length - 1] : null;
     if (!ta || !btn || ta.dataset.omnixShortcut) return;
     ta.dataset.omnixShortcut = '1';
     ta.addEventListener('keydown', function (e) {
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
-        btn.click();
+        // FIX ("been pressing enter for 5 min and it's still not showing anything"): every
+        // widget interaction - including a submit click - tells Streamlit to ABANDON whatever
+        // script run is currently in progress and start a brand-new one with the latest state.
+        // If Enter gets pressed again before that first run has had a chance to actually finish
+        // and show a result, it cancels that run and restarts from scratch - do that every few
+        // seconds (exactly what repeatedly pressing Enter out of frustration does) and the app
+        // can NEVER complete a single run far enough to show anything, no matter how long you
+        // wait, because every attempt keeps getting cut off by the next one before it can
+        // finish. This debounce - stored on window.parent, the one actual browser window that
+        // survives across every Streamlit re-render, unlike this script's own iframe which gets
+        // torn down and rebuilt from scratch on every single rerun - simply ignores repeat
+        // Enter presses for a few seconds after the first one goes through, so one request
+        // actually gets the chance to complete instead of being restarted forever.
+        var now = Date.now();
+        if (window.parent.__omnixLastSubmit && (now - window.parent.__omnixLastSubmit) < 4000) {
+          return;
+        }
+        window.parent.__omnixLastSubmit = now;
+        // re-resolve on every keypress rather than using the button captured at patch-time -
+        // Streamlit can re-render/replace the button element between renders, which would
+        // otherwise leave this listener holding a stale, now-detached button reference.
+        var live = box.querySelectorAll('button');
+        var target = live.length ? live[live.length - 1] : btn;
+        target.click();
       }
     });
   }
@@ -5073,10 +5144,22 @@ def render_message(msg: dict, key_prefix="m"):
     render(msg.get("content", ""), key_prefix=key_prefix)
 
 
-def message_toolbar(idx, msg, is_last):
+def message_toolbar(idx, msg, is_last, show_copy=True):
     c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
     with c1:
-        copy_button(msg.get("content", ""), "📋 Copy reply")
+        # FIX ("page keeps on loading...after a few min it captures my question" - gets worse
+        # the longer the chat gets): copy_button() below renders via components.html(), which
+        # creates a real browser <iframe>. This toolbar runs for EVERY assistant message in the
+        # WHOLE history on EVERY single rerun (every message sent, every button tap, anything) -
+        # so a chat with 40 replies meant rebuilding 40 iframes from scratch, every single time,
+        # before the page could finish painting. That overhead scales with chat length, which is
+        # exactly why it feels fine early on and grinds to a crawl later. The copy button itself
+        # is only ever useful on messages someone can actually still see without scrolling far,
+        # so it's now only rendered (only creates its iframe) for the most recent handful of
+        # messages - every other toolbar button here is a native st.button (no iframe, ~free)
+        # and still renders on every message as before.
+        if show_copy:
+            copy_button(msg.get("content", ""), "📋 Copy reply")
     with c2:
         if st.button("📄 To Word", key=f"word_{idx}"):
             with st.spinner("Formatting..."):
@@ -5227,7 +5310,12 @@ def build_system_prompt(history, kb, web_on, style_name):
         "the web results / file excerpts below or your solid knowledge support; if unsure, say so plainly. "
         "Never attach a source to an item that source doesn't state; never add a list item because it "
         "'would typically exist' or to reach an expected total; never output a URL/phone/email that is "
-        "not verbatim in the sources.\n"
+        "not verbatim in the sources. If you are not genuinely certain of a specific fact, do ONE of these "
+        "instead of stating it as confirmed: say plainly that you're not certain / don't have confirmed "
+        "information on that specific point, clearly mark it as an approximation ('roughly', 'around'), or "
+        "ask the user for the detail if it's essential. A partial, honestly-hedged answer is always better "
+        "than a complete, confident-sounding one that contains an invented specific - a wrong name or "
+        "number stated with total confidence is worse than no answer at all.\n"
     ) + FORMAT_RULES
 
     # FIX (speaker notes weaker than ChatGPT): a generic "answer the question" system prompt
@@ -5438,12 +5526,14 @@ ATTACHED-FILE RULES:
 def stream_response(history, kb, web_on, model_name, temp, style_name):
     system_prompt = build_system_prompt(history, kb, web_on, style_name)
     # For a factual question the slider's creativity only adds plausible-sounding inventions, so
-    # it is capped regardless of the slider. (Reasoning effort stays "low": the source-grounding
-    # guard, not extra hidden reasoning tokens, is what protects accuracy - and those tokens
-    # count against the free daily quota.)
+    # it is capped regardless of the slider.
     strict = bool((st.session_state.get("_ground_info") or {}).get("strict"))
     if strict:
         temp = min(temp, 0.1)
+    # FIX (reverted per feedback - "consuming token too fast"): back to "low" effort / original
+    # output caps. The deadline/timeout fixes above are the ones actually targeting the "still
+    # stopping" symptom, and they cost no extra tokens at all - effort/cap size is unrelated to
+    # that bug, so there's no reason to also carry the quota cost of the earlier attempt.
     effort = "low"
     _advance_rr()
     # A previous WRONG answer stays in the chat history and gets sent back to the model on the
@@ -5468,6 +5558,25 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
 
     candidates = [model_name] + [m for m in MODELS if m != model_name]
     soonest = float("inf")
+    # FIX ("still stopping" persisting across multiple retry-logic fixes - the real culprit may
+    # not be the retry logic at all): Streamlit Cloud keeps one WebSocket connection open per
+    # browser tab. If a single response takes too long to resolve - which easily happens once
+    # you're cycling through several (model, key) combinations, each with its own several-second
+    # timeout, sometimes followed by the "last resort" sleep-and-resweep loop - that connection
+    # can silently drop on the client/proxy side while the server keeps working. The server then
+    # finishes the message just fine, but the browser already stopped listening, so the page sits
+    # frozen forever on whatever it last received - no error, because nothing actually broke, just
+    # a dead connection nothing here can revive. A hard wall-clock budget on the WHOLE attempt (not
+    # just each individual network call) keeps any single response short enough to stay well under
+    # typical proxy/websocket idle limits: if nothing has worked by then, give up cleanly and let
+    # the calling code show "interrupted" + offer a retry, rather than silently grinding on for a
+    # minute-plus in the background where a dropped connection can never show the result at all.
+    _start_time = time.time()
+    _RESPONSE_DEADLINE = 25.0
+
+    def _deadline_hit() -> bool:
+        return (time.time() - _start_time) > _RESPONSE_DEADLINE
+
     # Everything generated so far across ALL attempts: if one key/model drops mid-stream, or the
     # answer hits the output cap, the next attempt is asked to CONTINUE from exactly that point,
     # so the user sees one seamless answer rather than a stop or a restart.
@@ -5489,7 +5598,11 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
     def _groq_pass():
         nonlocal soonest
         for candidate in candidates:
+            if _deadline_hit():
+                return  # don't start a fresh candidate once we're past the time budget
             for gi, gclient in _rotated_clients():
+                if _deadline_hit():
+                    return
                 if _is_cooling("groq", candidate, gi):
                     continue  # remembered as at its limit - go straight to one that isn't
                 try:
@@ -5545,44 +5658,21 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
     if state["done"]:
         return
 
-    # Separate free pools next (each has its own quota): optional extra providers, then OpenRouter.
-    extra_text = _call_extra_providers(_current_msgs(), temp, base_max)
-    if extra_text:
-        partial_pieces.append(extra_text)
-        yield extra_text
-        return
-    for candidate in OPENROUTER_MODELS:
-        for okey in OPENROUTER_API_KEYS:
-            text = _call_openrouter(_current_msgs(), candidate, temp, okey)
-            if text:
-                partial_pieces.append(text)
-                yield text
-                return
-
-    # Last resort: every pool looked busy on this sweep. Real per-minute limits clear on their
-    # own well within a couple of minutes, so instead of failing here, keep sleeping in short
-    # bursts and re-sweeping EVERY pool (Groq, extra providers, OpenRouter) until one frees up or
-    # MAX_FINAL_WAIT is used up - only a genuinely full outage across every connected free
-    # account still reaches the busy message below.
-    waited = 0.0
-    while waited < MAX_FINAL_WAIT:
-        wait_left = _soonest_cooldown()
-        if wait_left == float("inf"):
-            wait_left = 5.0  # nothing specifically known to be cooling - still worth a short
-                              # pause and another full sweep rather than giving up right away
-        nap = min(wait_left, 4.0) + 0.3
-        time_sleep(nap)
-        waited += nap
-
-        yield from _groq_pass()
-        if state["done"]:
-            return
+    # Separate free pools next (each has its own quota): optional extra providers, then
+    # OpenRouter. FIX: these are non-streaming calls with their own 60s-per-attempt timeout,
+    # tried one after another - previously with NO overall time budget at all, so this stage
+    # alone could silently run for minutes across several providers/keys. Now gated by the same
+    # deadline as the Groq pass so total response time stays bounded.
+    if not _deadline_hit():
         extra_text = _call_extra_providers(_current_msgs(), temp, base_max)
         if extra_text:
             partial_pieces.append(extra_text)
             yield extra_text
             return
+    if not _deadline_hit():
         for candidate in OPENROUTER_MODELS:
+            if _deadline_hit():
+                break
             for okey in OPENROUTER_API_KEYS:
                 text = _call_openrouter(_current_msgs(), candidate, temp, okey)
                 if text:
@@ -5590,9 +5680,79 @@ def stream_response(history, kb, web_on, model_name, temp, style_name):
                     yield text
                     return
 
-    if partial_pieces:
-        return
+    # Last resort: every pool looked busy on this sweep. Real per-minute limits clear on their
+    # own well within a couple of minutes, so instead of failing here, keep sleeping in short
+    # bursts and re-sweeping EVERY pool (Groq, extra providers, OpenRouter) - but only within
+    # what's left of the SAME overall deadline (not a fresh extra budget stacked on top of it,
+    # which is what let total wall-clock time balloon past what a browser connection can survive).
+    while not _deadline_hit():
+        wait_left = _soonest_cooldown()
+        if wait_left == float("inf"):
+            wait_left = 3.0  # nothing specifically known to be cooling - still worth a short
+                              # pause and another full sweep rather than giving up right away
+        remaining = _RESPONSE_DEADLINE - (time.time() - _start_time)
+        nap = min(wait_left, 3.0, max(remaining, 0.0)) 
+        if nap <= 0:
+            break
+        time_sleep(nap)
+
+        yield from _groq_pass()
+        if state["done"]:
+            return
+        if _deadline_hit():
+            break
+        extra_text = _call_extra_providers(_current_msgs(), temp, base_max)
+        if extra_text:
+            partial_pieces.append(extra_text)
+            yield extra_text
+            return
+        if _deadline_hit():
+            break
+        for candidate in OPENROUTER_MODELS:
+            if _deadline_hit():
+                break
+            for okey in OPENROUTER_API_KEYS:
+                text = _call_openrouter(_current_msgs(), candidate, temp, okey)
+                if text:
+                    partial_pieces.append(text)
+                    yield text
+                    return
+
+    # FIX ("stops in between" recurring, silently, with no error shown): a cutoff that happened
+    # AFTER some real content had already streamed used to just `return` here with no exception
+    # at all - which meant the app's own recovery (the "interrupted" note, and skipping caching
+    # a broken answer) never ran, because that recovery only triggers on a raised exception. The
+    # truncated text was instead silently treated as a complete, successful answer and CACHED as
+    # such - so re-asking the same question could hand back that same cut-off answer again.
+    # Always raising here (whether or not partial content exists) lets the existing, already-
+    # correct handling in the calling code do its job every time.
     raise AllModelsBusy(_busy_message(min(soonest, _soonest_cooldown())))
+
+
+# FIX ("still stopping" mid-sentence with no error): text-level heuristic used by the
+# continuation backstop above - is this reasonably likely to be a genuinely finished answer,
+# or does it look like it just trails off? Deliberately conservative (only flags the clear
+# cases) so it never nags a real, complete answer into an unnecessary extra round-trip.
+_INCOMPLETE_TAIL_RE = re.compile(r"[,:;\-–—]\s*$|\b(?:a|an|the|and|or|but|of|to|in|on|at|for|with|is|are|was|were)\s*$", re.I)
+
+def _looks_incomplete(text: str) -> bool:
+    t = text.rstrip()
+    if not t:
+        return False
+    # closing markdown/code/lists are fine even without sentence punctuation
+    if t.endswith(("```", "---", ":", "```\n")):
+        return t.endswith(":")  # a trailing bare colon with nothing after it IS suspicious
+    last = t[-1]
+    if last in ".!?\"'”’)]}`*":
+        return False
+    if _INCOMPLETE_TAIL_RE.search(t):
+        return True
+    # ends mid-word (no whitespace/punct right before what would be a natural break) on a
+    # fairly long answer is the strongest signal of all - a real answer basically never ends
+    # on a bare word with no closing punctuation at all once it's more than a few words long
+    if len(t) > 40 and last.isalnum():
+        return True
+    return False
 
 
 def response_cache_key(chat_name, kb, prompt_text, model_name, temp, style_name, web_on):
@@ -5631,7 +5791,8 @@ for i, msg in enumerate(messages):
         with st.chat_message("assistant"):
             render_message(msg, key_prefix=f"m{i}")
             if not msg.get("image") and not msg.get("file"):
-                message_toolbar(i, msg, is_last=(i == len(messages) - 1))
+                message_toolbar(i, msg, is_last=(i == len(messages) - 1),
+                                 show_copy=(i >= len(messages) - 6))
             # FIX ("AI should talk back to me verbally"): a manual 🔊 Play tap on THIS message
             # speaks it once, right where it was clicked.
             if st.session_state.speak_now_idx == i:
@@ -5905,9 +6066,75 @@ if prompt or (regen and messages and messages[-1]["role"] == "user"):
             else:
                 placeholder.markdown("⏳ Thinking...")
                 try:
+                    # FIX ("it is again stopping, this should not stop in btw"): the old version
+                    # called placeholder.markdown() on EVERY single token. Streamlit pushes each
+                    # of those as its own message over the browser's websocket - for a long
+                    # answer that's hundreds/thousands of messages fired as fast as the model can
+                    # generate them. On anything but a very fast connection (and reliably on
+                    # Streamlit Community Cloud's shared/free tier) the browser can't keep up:
+                    # the queue backs up and the page visibly freezes on a half-finished sentence
+                    # even though the model finished generating and the server-side code moved on
+                    # - which is exactly "it stops in between" with no error ever shown, because
+                    # nothing actually errored. Batching redraws to a small time interval (~12/sec
+                    # - still feels perfectly live) cuts the message volume by 1-2 orders of
+                    # magnitude so the connection can always keep up, and a final unconditional
+                    # placeholder.markdown(acc) right after the loop guarantees the finished text
+                    # is always the very last thing drawn (no lingering "▌" cursor if a redraw was
+                    # mid-throttle when the stream ended).
+                    _last_draw = 0.0
+                    _DRAW_EVERY = 0.08
                     for piece in stream_response(messages, active_kb, effective_web, model, temperature, style):
                         acc += piece
+                        _now = time.time()
+                        if _now - _last_draw >= _DRAW_EVERY:
+                            placeholder.markdown(normalize_math(acc) + " ▌")
+                            _last_draw = _now
+                    placeholder.markdown(normalize_math(acc))
+
+                    # FIX ("still stopping" - mid-sentence, mid-word, with NO error shown at
+                    # all): that screenshot is the smoking gun. If an error had been raised,
+                    # st.error(...) below would have printed something - it didn't, which means
+                    # stream_response() returned NORMALLY (its own internal continue-on-cutoff
+                    # logic decided the answer was "done"). Its finish_reason checks can be
+                    # fooled by a provider that reports "stop" (or simply closes the connection)
+                    # partway through a sentence, and once that happens no amount of internal
+                    # retrying kicks in because, as far as that logic is concerned, nothing went
+                    # wrong. This is a second, independent backstop that doesn't trust
+                    # finish_reason at all: it looks at the ACTUAL TEXT once streaming is over,
+                    # and if it plainly trails off (no closing punctuation, mid-word, mid-list,
+                    # ends in a comma/colon/dash, etc.) it fires one or more fresh continuation
+                    # requests - each a brand-new stream_response() call (so it gets its own full
+                    # sweep of every model/key again) - and keeps appending until the answer
+                    # actually reads as finished or a small retry ceiling is hit. This is what
+                    # finally guarantees the text shown to the user is never left hanging
+                    # mid-thought, regardless of what caused the first cutoff.
+                    _continue_tries = 0
+                    while acc.strip() and _looks_incomplete(acc) and _continue_tries < 3:
+                        _continue_tries += 1
                         placeholder.markdown(normalize_math(acc) + " ▌")
+                        cont_messages = messages + [
+                            {"role": "assistant", "content": acc},
+                            {"role": "user", "content": (
+                                "Your previous answer above was cut off mid-thought. Continue it "
+                                "EXACTLY from where it left off - do not repeat any part of it, do "
+                                "not restart, do not add any preamble like 'continuing...' - just "
+                                "carry on the sentence/thought seamlessly as if uninterrupted, and "
+                                "finish it properly this time."
+                            )},
+                        ]
+                        try:
+                            for piece in stream_response(
+                                cont_messages, active_kb, effective_web, model, temperature, style
+                            ):
+                                acc += piece
+                                _now = time.time()
+                                if _now - _last_draw >= _DRAW_EVERY:
+                                    placeholder.markdown(normalize_math(acc) + " ▌")
+                                    _last_draw = _now
+                            placeholder.markdown(normalize_math(acc))
+                        except Exception:
+                            break  # couldn't get more - show what we have rather than nothing
+
                     if (st.session_state.get("_ground_info") or {}).get("strict"):
                         placeholder.markdown(normalize_math(acc) + "\n\n_🔎 Checking every name and link against the sources..._")
                         acc = apply_grounding_guard(acc, current_prompt)
